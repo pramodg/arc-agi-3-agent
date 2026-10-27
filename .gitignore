@@ -1,0 +1,27 @@
+state
+venv
+var
+__pycache__
+# Secrets: the Kaggle token and the ARC API key never enter git.
+.kaggle/
+.env
+*.token
+# Environments, downloaded games, vendored framework, generated notebook
+.venv/
+vendor/
+environment_files/
+recordings/
+notebooks/submission.ipynb
+*.log
+# Model weights and archives
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.parquet
+*.zip
+*.tar.gz
+.arc_api_key
+reference/
