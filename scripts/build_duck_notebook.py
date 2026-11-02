@@ -67,6 +67,7 @@ byte-identical to Franzen's patch, and writes it where his env cell applies it.
     python3 -m pipeline.toolchain run scripts/build_duck_notebook.py --variant jev-gates [--base v2] --out DIR
     python3 -m pipeline.toolchain run scripts/build_duck_notebook.py --kernel-id ID --out DIR
     python3 -m pipeline.toolchain run scripts/build_duck_notebook.py --write-harness
+    python3 scripts/build_duck_notebook.py --variant v1 --unsplit --out DIR   # a final as scored
 """
 from __future__ import annotations
 
@@ -501,10 +502,10 @@ def sha256(text: str) -> str:
 
 def write(out_dir: Path = OUT_DIR, evaluate: bool = False,
           variant: str = DEFAULT_VARIANT, kernel_id: str = KERNEL_ID,
-          base: str | None = None) -> Path:
+          base: str | None = None, split: bool = True) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / CODE_FILE
-    path.write_text(notebook_text(evaluate, variant, base=base))
+    path.write_text(notebook_text(evaluate, variant, split, base))
     (out_dir / "kernel-metadata.json").write_text(
         json.dumps(metadata(variant, kernel_id, base), indent=2) + "\n")
     return path
@@ -520,6 +521,9 @@ def main() -> None:
     p.add_argument("--out", type=Path, default=OUT_DIR)
     p.add_argument("--kernel-id", default=KERNEL_ID,
                    help="push target in the metadata (default: the fork kernel)")
+    p.add_argument("--unsplit", action="store_true",
+                   help="keep Franzen's one patch cell, as in the notebooks scored "
+                        "before the split (the finals v1 and v2)")
     p.add_argument("--write-harness", action="store_true",
                    help="rewrite duck/harness/ from Franzen's patch and stop")
     a = p.parse_args()
@@ -529,7 +533,7 @@ def main() -> None:
         return
     if (a.variant != DEFAULT_VARIANT or a.kernel_id != KERNEL_ID or a.base) and a.out == OUT_DIR:
         p.error("only the default variant and kernel may overwrite notebooks/duck/; pass --out")
-    path = write(a.out, a.evaluate, a.variant, a.kernel_id, a.base)
+    path = write(a.out, a.evaluate, a.variant, a.kernel_id, a.base, not a.unsplit)
     print(f"wrote {path} sha256 {sha256(path.read_text())}")
 
 

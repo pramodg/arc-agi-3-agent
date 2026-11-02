@@ -46,27 +46,53 @@ The first play downloads the public games into a local cache. After that,
 - `docs/requirements.md` is the competition's rules, with sources.
 - `var/` is runtime output (game caches, recordings, logs). Ignored by git.
 
-## The submitted agent: the two-mode player on the Duck fork (tm-5-ask)
+## The finals: Duck fork v1 (top) and v2
 
-The entry submitted on 2026-11-02 is not `agent/my_agent.py`. It is a fork
-of Daniel Franzen's ARC-AGI-3 Milestone 2 notebook, which runs Tufa Labs'
-Duck harness around an open-weights Qwen3.8-Flash-Next model on Kaggle's own
-GPU, with internet off. Our variant, tm-5-ask, adds a two-mode player:
+The submitted agent is not `agent/my_agent.py`. It is a fork of Daniel
+Franzen's ARC-AGI-3 Milestone 2 notebook, which runs Tufa Labs' Duck harness
+around an open-weights Qwen3.8-Flash-Next model on Kaggle's own GPU, with
+internet off. Kaggle keeps the two best public scores as the finals:
+
+| Final | Variant | Kaggle submission | Public score | Notebook sha256 |
+|---|---|---|---|---|
+| Top | v1 | 57717186 | 29.55 | `383f4cb43ad39187db0babe5593901713e16985b1227896ea1159ae15539bebf` |
+| Second | v2 | 57752683 | 28.38 | `6ce147f0bfa24402b2d6797b6697ac99943c8a59af517dbcfbdd3f2877040ad4` |
+
+v1 is the plain fork: a 40-minute model startup deadline instead of 12, a
+short commit run that plays no games, and our own kernel id. v2 adds the
+solved-level memory (`duck/solved_level_memory.py`): each cleared level's
+facts and the model's one-line rule are pinned at the end of the system
+prompt, for the current game only.
+
+Rebuild either final exactly:
+
+    python3 scripts/build_duck_notebook.py --variant v1 --unsplit --out finals/v1
+    python3 scripts/build_duck_notebook.py --variant v2 --unsplit --out finals/v2
+
+They print the sha256 values above. `--unsplit` keeps Franzen's harness
+patch in one cell, as the notebooks were when they were scored; later
+builds cut it into pieces, which changes the bytes but not the patch.
+
+### The last entry: the two-mode player (tm-5-ask)
+
+The last entry, submitted on 2026-11-02, is tm-5-ask (submission 57904471,
+public score 24.61). It is below both finals. It adds a two-mode player:
 recognise, understand (which object is the player, what it carries, what
 ends a level or a life, what drains with each action), test, and hand off to
 play. It keeps a rules note for the current game only. It carries no replay
 of solved levels and no store shared between games.
-
-Rebuild the notebook exactly:
 
     python3 scripts/build_duck_notebook.py --variant tm-5-ask --out notebooks/duck
 
 It prints sha256 `f6ec1363a8c02a4e5ed059d1a05907004b88fec97afa16ab092550a47a3d96d8`,
 the hash of `notebooks/duck/arc-agi-3-duck-fork.ipynb` here.
 
+### What is where in the fork
+
 - `scripts/build_duck_notebook.py` is our builder.
 - `duck/variants/*.toml` name each variant and the cells it adds;
-  tm-5-ask builds on earlier variants there, back to v1.
+  v1 and v2 are the finals; tm-5-ask builds on earlier variants there,
+  back to v1.
 - `duck/twomode/`, `duck/bigmodel/`, `duck/r3/`, `duck/r4/`, `duck/staged/`,
   `duck/hypothesis/`, `duck/twotier/`, `duck/gate_cell.py` and
   `duck/standin_cell.py` are our cells (MIT-0).
