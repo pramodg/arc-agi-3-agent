@@ -1,0 +1,930 @@
+@@ -309,7 +2500,17 @@ def _empty_world_model() -> dict[str, str]:
+ 
+ 
+ def _request_tool_choice(tools: list[dict[str, Any]] | None) -> str | None:
+-    return "auto" if tools else None
++    """Tool-choice sent with tool-bearing requests. LOCAL_ANALYZER_TOOL_CHOICE
++    overrides the default "auto": set "omit"/"none" to drop the field for
++    servers whose validation rejects "auto" without a tool-call parser (tools
++    are still sent, so chat templates still render tool instructions); any
++    other value (e.g. "required") passes through verbatim."""
++    if not tools:
++        return None
++    choice = os.environ.get("LOCAL_ANALYZER_TOOL_CHOICE", "auto").strip().lower()
++    if choice in ("", "omit", "none"):
++        return None
++    return choice
+ 
+ 
+ def _trim_log_text(text: str, *, max_chars: int = _RESPONSE_META_MAX_CHARS) -> str:
+@@ -323,6 +2524,7 @@ def _trim_log_text(text: str, *, max_chars: int = _RESPONSE_META_MAX_CHARS) -> s
+ def _format_model_response_meta(
+     *,
+     finish_reason: str,
++    served_by: str,
+     reasoning: str,
+     content: str,
+     tool_calls: list[dict[str, Any]],
+@@ -332,6 +2534,7 @@ def _format_model_response_meta(
+ ) -> str:
+     lines = [
+         f"finish_reason: {finish_reason or '(empty)'}",
++        f"served_by: {served_by or '(unknown)'}",
+         f"tool_call_count: {len(tool_calls)}",
+         f"content_chars: {len(content)}",
+         f"reasoning_chars: {len(reasoning)}",
+@@ -347,15 +2550,203 @@ def _format_model_response_meta(
+     return "\n".join(lines)
+ 
+ 
++def _estimate_diff_tokens(text: str) -> int:
++    return len(text) // 3
++
++
++def _diff_entry_line(bucket: str, entry: dict[str, Any]) -> str:
++    color = entry.get("color")
++    pixels = entry.get("pixels")
++    if bucket == "moved":
++        line = f"moved: color {color} {pixels}px {entry.get('from')}->{entry.get('to')}"
++        if entry.get("rotated_by"):
++            line += f" rotated_by {entry['rotated_by']}"
++        return line
++    if bucket == "rotated":
++        return (
++            f"rotated: color {color} {pixels}px by {entry.get('rotated_by')} "
++            f"at {entry.get('at')}"
++        )
++    if bucket == "changed_color":
++        return (
++            f"recolored at {entry.get('at')}: color "
++            f"{entry.get('before_color')}->{entry.get('after_color')} "
++            f"({entry.get('pixels')}px)"
++        )
++    if bucket == "resized":
++        return (
++            f"resized: color {entry.get('color')} "
++            f"{entry.get('before_pixels')}->{entry.get('after_pixels')}px "
++            f"at {entry.get('at_before')}"
++        )
++    return f"{bucket}: color {color} {pixels}px at {entry.get('at')}"
++
++
++_DIFF_BUCKETS = ("moved", "rotated", "changed_color", "resized", "appeared", "disappeared")
++
++
++def _render_auto_frame_diff(
++    diff: dict[str, Any], budget_tokens: int, total_cells: int | None = None
++) -> list[str]:
++    """Render a frame diff as prompt lines, degrading to stay under budget:
++    full listing -> aggregated by (bucket, color, pixels) -> counts only.
++    Resized entries covering most of the grid (the background reshaping as
++    collateral of other objects moving) are elided as noise; the callable
++    frame_diff() keeps them."""
++    if total_cells:
++        resized = diff.get("resized") or []
++        kept = [e for e in resized if (e.get("before_pixels") or 0) * 2 < total_cells]
++        if len(kept) != len(resized):
++            diff = dict(diff)
++            diff["resized"] = kept
++    count = diff.get("changed_cell_count")
++    if count == -1:
++        return [f"grid shape changed ({diff.get('before_shape')} -> {diff.get('after_shape')}); per-object diff skipped."]
++    header = f"{count} cells changed."
++    # rung 1: full listing
++    full = [header]
++    for bucket in _DIFF_BUCKETS:
++        for entry in diff.get(bucket) or []:
++            full.append("- " + _diff_entry_line(bucket, entry))
++    if _estimate_diff_tokens("\n".join(full)) <= budget_tokens:
++        return full
++    # rung 2: aggregate identical entries, largest objects first, capped
++    lines = [header]
++    for bucket in _DIFF_BUCKETS:
++        entries = list(diff.get(bucket) or [])
++        if not entries:
++            continue
++        entries.sort(key=lambda e: -(e.get("pixels") or e.get("after_pixels") or 0))
++        groups: dict[tuple, int] = {}
++        for entry in entries:
++            key = (entry.get("color"), entry.get("pixels"))
++            groups[key] = groups.get(key, 0) + 1
++        shown = 0
++        for entry in entries:
++            if shown >= 3:
++                break
++            key = (entry.get("color"), entry.get("pixels"))
++            if groups.get(key, 0) > 3:
++                continue
++            lines.append("- " + _diff_entry_line(bucket, entry))
++            shown += 1
++        swarm = {k: n for k, n in groups.items() if n > 3}
++        for (color, pixels), n in sorted(swarm.items(), key=lambda kv: -kv[1]):
++            lines.append(f"- {bucket}: {n}x color {color} {pixels}px (positions elided)")
++        remaining = len(entries) - shown - sum(swarm.values())
++        if remaining > 0:
++            lines.append(f"- {bucket}: +{remaining} more")
++    lines.append("(call frame_diff() in python for the full object list)")
++    if _estimate_diff_tokens("\n".join(lines)) <= budget_tokens:
++        return lines
++    # rung 3: counts only, cannot be large
++    parts = [
++        f"{len(diff.get(bucket) or [])} {bucket}"
++        for bucket in _DIFF_BUCKETS
++        if diff.get(bucket)
++    ]
++    return [
++        header + " " + ", ".join(parts) + " (details omitted; call frame_diff() in python)."
++    ]
++
++
+ def _build_system_prompt(*, tool_output_tokens: int) -> str:
+     prompt = "You are a coding agent solving a grid-based puzzle game."
++    # ARC3_SYSTEM_PROMPT_PREFIX (read at call time): prepended verbatim as the
++    # first line(s) of the system prompt. Intended for model-specific control
++    # directives that live in the system prompt, e.g. Nemotron's "/think"
++    # reasoning toggle. Empty/unset leaves the prompt unchanged.
++    _prefix = os.environ.get("ARC3_SYSTEM_PROMPT_PREFIX", "").strip()
++    if _prefix:
++        prompt = f"{_prefix}\n\n{prompt}"
+     prompt += GAME_OVERVIEW_ADDENDUM
+     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
++    if _explain_gameplay_changed():
++        prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
++            border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
++        )
++    if _animation_enabled():
++        prompt += ANIMATION_ADDENDUM
++        if _animation_timeline_enabled():
++            prompt += ANIMATION_ADDENDUM_TIMELINE
+     if current_grid_image_enabled():
+         prompt += MULTIMODAL_CONTEXT_ADDENDUM
++    if _AUTO_FRAME_DIFF:
++        prompt += (
++            " Each turn's message includes an 'Auto frame diff' section summarizing "
++            "object-level changes since your previous analyzer turn (it spans all "
++            "actions executed in between, not just the last one). Treat it as ground "
++            "truth for what changed, consult it before acting, and call `frame_diff()` "
++            "in python when you need per-action or full object detail."
++        )
++    if _DIFF_IMAGE and current_grid_image_enabled():
++        prompt += (
++            " Alongside the current grid image you receive a diff image: cells that "
++            "changed since your previous analyzer turn are shown in their new true "
++            "color; unchanged cells are dimmed to a dark navy that is not a game "
++            "color. Use it to locate change at a glance."
++        )
+     prompt += VISUAL_GAME_ADDENDUM
+-    prompt += PYTHON_ADDENDUM
+-    prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(tool_output_tokens=tool_output_tokens)
++    if _get_env_bool("ARC3_ACTION_INFO", False):
++        # The action-info section replaces the earlier coordinate-only guidance.
++        prompt = prompt.replace(
++            "- For `MOUSE`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.\n",
++            "",
++        )
++        prompt += ACTION_INFO_ADDENDUM
++        if undo_exposure_mode() == "on":
++            prompt += UNDO_INFO_ADDENDUM
++        if reset_exposed():
++            prompt += RESET_INFO_ADDENDUM
++    prompt += (
++        PYTHON_ADDENDUM_HEAD.replace(
++            "- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.\n",
++            "- Python variables reset between tool calls. Re-import modules as needed; "
++            "eligible functions are retained as described in the tool session rules below.\n",
++        ) if _persistent_functions() else PYTHON_ADDENDUM_HEAD
++    )
++    prompt += (
++        WORLD_MODEL_FREE_ADDENDUM if _memory_sections_disabled() else WORLD_MODEL_ADDENDUM
++    )
++    prompt += PYTHON_ADDENDUM_TAIL
++    if _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
++        # documents `frame_diff(before, after)`. The function stays callable
++        # either way - this only controls whether the model is told about it,
++        # so the arm measures whether knowing costs more than it returns.
++        prompt += FRAME_DIFF_HINT_ADDENDUM
++    if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
++        # General checks during action sequences and targeted probes when search fails.
++        prompt += STEP_VERIFICATION_ADDENDUM
++    # only describe the guards that are actually armed: prompt weight spent on a
++    # mechanism that cannot fire is weight the model reads and cannot use, and an
++    # exception it is told about but never sees is worse than silence
++    # The guards are no longer described up front. Every claim the addenda made -
++    # not executed, nothing spent, the batch is checked throughout, how to
++    # override - is repeated in the refusal message itself, which arrives with
++    # the concrete action attached and only when it is relevant. Describing a
++    # mechanism the model may never meet is prompt weight spent on nothing.
++    prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(
++        tool_output_tokens=tool_output_tokens,
++        prefer_tool_calls=PREFER_TOOL_CALLS_LINE if _prefer_tool_calls() else "",
++        persistent_functions=(
++            PERSISTENT_FUNCTIONS_LINE.format(lifetime=(
++                "for later calls throughout this game, including across level changes; "
++                "they are cleared when a new game starts"
++                if _persistent_functions_scope() == "game" else
++                "for later calls on the same level; they are cleared when the level changes"
++                if _persistent_functions_scope() == "levelup" else
++                "for later calls in this analyzer turn, including yield resumptions; "
++                "they are cleared at the start of the next turn"
++            ), import_guidance=(
++                "Supported explicit top-level imports used by retained functions are restored "
++                "with them; imports inside a function also work."
++                if _get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False) else
++                "Put needed imports inside the function."
++            )) if _persistent_functions() else EPHEMERAL_FUNCTIONS_LINE
++        ),
++    )
++    if _level_transfer_guidance_enabled():
++        prompt = apply_level_transfer_system_guidance(prompt)
+     return prompt
+ 
+ 
+@@ -378,6 +2769,12 @@ class AnalyzerTurnResult:
+ class _ToolDispatchResult:
+     content: str
+     step_executed: bool = False
++    # True when an executed action changed the board outside the HUD border, or
++    # ended the level or the attempt. "Executed" alone is too weak a signal for
++    # the reasoning-effort ladder: bumping a wall executes and achieves nothing,
++    # and resetting on it lets the model oscillate between truncating at full
++    # effort and acting inertly at reduced effort, never settling.
++    made_progress: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+@@ -398,6 +2795,7 @@ class _AsciiFrameView:
+ class _AsciiHistoryEntryView:
+     action: str
+     frame: _AsciiFrameView
++    result: dict[str, Any]
+ 
+     def __str__(self) -> str:
+         return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
+@@ -422,7 +2820,10 @@ def _to_ascii_history_views(history_entries: list[HistoryEntry]) -> list[_AsciiH
+         frame_view = _to_ascii_frame_view(entry.frame)
+         if frame_view is None:
+             continue
+-        views.append(_AsciiHistoryEntryView(action=entry.action, frame=frame_view))
++        views.append(_AsciiHistoryEntryView(
++            action=entry.action, frame=frame_view,
++            result=dict(getattr(entry, "result", {}) or {}),
++        ))
+     return views
+ 
+ 
+@@ -445,26 +2846,167 @@ def _ascii_history_view_payload(history_entries: list[HistoryEntry]) -> list[dic
+         frame_payload = _ascii_frame_view_payload(entry.frame)
+         if frame_payload is None:
+             continue
+-        payload.append({"action": entry.action, "frame": frame_payload})
++        payload.append({
++            "action": entry.action, "frame": frame_payload,
++            "result": dict(getattr(entry, "result", {}) or {}),
++        })
+     return payload
+ 
+ 
+-def _format_action_span(start_action_num: int | None, end_action_num: int | None) -> str | None:
+-    if start_action_num is None or end_action_num is None:
++_VISION_PATCH_PIXELS = 32          # Qwen3.6: 16px patches, 2x2 merge
++_VISION_SENTINEL_TOKENS = 2        # vision start/end markers
++_IMAGE_TOKENS_FALLBACK = 402       # 64-cell board at MULTIMODAL_UPSCALE=10
++_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
++
++
++def _text_token_chars() -> int:
++    """Characters per token for the text heuristic - the SEED value only.
++
++    Measured against a server-reported prompt_tokens on a real request: 25,189
++    characters of system prompt plus opener tokenised to 5,892, i.e. about 4.3
++    characters per token. The 3 default therefore over-counts text by roughly
++    40%, so the trimmer evicts history the budget could have held. This value
++    is used until the first response supplies a measurement; after that
++    ARC3_CALIBRATE_TEXT_TOKENS drives the divisor from the server's own
++    figures."""
++    return max(1, _get_env_int("ARC3_TEXT_TOKEN_CHARS", 3))
++
++
++def _calibrate_text_tokens() -> bool:
++    """Derive the characters-per-token divisor from the server's reported
++    prompt_tokens rather than a fixed guess.
++
++    Every response carries prompt_tokens for the request that produced it - an
++    exact count including the chat template. Subtracting the vision cost of the
++    request's images leaves the text, and dividing by the text characters gives
++    the divisor for the next estimate. No extra requests, no tokenizer, and it
++    tracks content: code-heavy turns tokenise differently from prose.
++
++    The last measurement is used rather than an average: history carries
++    forward, so the prompt just measured is mostly the prompt about to be
++    built, and averaging would blend in content already evicted."""
++    return _get_env_bool("ARC3_CALIBRATE_TEXT_TOKENS", True)
++
++
++# Asymmetric on purpose. Over-counting trims history and degrades one game;
++# under-counting overflows the context, and an overflowing request holds a
++# slot and can pressure the others. Measured across 22 games: 2.75-3.69,
++# mean 3.12. The 3.3 ceiling therefore binds on the sparsest games by
++# design - a deliberate haircut - while the floor is set low enough that
++# only an arithmetic failure reaches it, and such a game is likely lost
++# anyway.
++def _text_token_chars_min() -> float:
++    """Floor for the calibrated divisor. Low enough that only an arithmetic
++    failure reaches it, and a game in that state is likely lost anyway."""
++    # a divisor of zero would make every estimate infinite and trim the whole
++    # history on the first request
++    return max(0.1, _get_env_float("ARC3_TEXT_TOKEN_CHARS_MIN", 1.0))
++
++
++def _text_token_chars_max() -> float:
++    """Ceiling for the calibrated divisor.
++
++    Exposed because 3.3 is a fitted constant, not a property of the tokeniser:
++    it came from 22 games measuring 2.75-3.69, so it binds on the sparsest
++    boards by design. A run whose prompts are denser than that sample - a
++    different game set, a longer system prompt, another model - is being
++    trimmed harder than its own measurements justify, and raising this is how
++    that is tested.
++    """
++    # never below the floor: an inverted pair would clamp every measurement to
++    # the ceiling and silently invert the guard's meaning
++    return max(_text_token_chars_min(),
++               _get_env_float("ARC3_TEXT_TOKEN_CHARS_MAX", 3.3))
++
++
++def _image_token_estimate_enabled() -> bool:
++    """Count image parts by their real vision-token cost instead of by the
++    length of their base64 payload. Without this an image is charged roughly
++    one token per three base64 characters - thousands for a board render whose
++    true cost is a few hundred - so enabling images silently evicts real
++    history."""
++    return _get_env_bool("ARC3_IMAGE_TOKEN_ESTIMATE", True)
++
++
++def _png_dimensions(data_url: str) -> tuple[int, int] | None:
++    """Width/height from a base64 PNG data URL, read from the IHDR header
++    without decoding the image. Only the first 24 bytes are needed."""
++    marker = "base64,"
++    index = data_url.find(marker)
++    if index < 0:
++        return None
++    head = data_url[index + len(marker):index + len(marker) + 32]
++    if len(head) < 32:
++        return None
++    try:
++        raw = base64.b64decode(head, validate=True)
++    except Exception:
+         return None
+-    if start_action_num <= 0 or end_action_num <= 0:
++    if len(raw) < 24 or not raw.startswith(_PNG_SIGNATURE) or raw[12:16] != b"IHDR":
+         return None
+-    if start_action_num == end_action_num:
+-        return f"{start_action_num}"
+-    return f"{start_action_num}-{end_action_num}"
++    width = int.from_bytes(raw[16:20], "big")
++    height = int.from_bytes(raw[20:24], "big")
++    if width <= 0 or height <= 0:
++        return None
++    return width, height
++
++
++def _image_part_tokens(part: dict[str, Any]) -> int:
++    """Vision tokens for one image content part: one token per merged patch
++    plus the two sentinel tokens. ARC3_IMAGE_TOKENS_FLAT overrides the
++    computation (useful for non-Qwen backends) and is also the fallback when
++    the header cannot be read."""
++    flat = _get_env_int("ARC3_IMAGE_TOKENS_FLAT", 0)
++    if flat > 0:
++        return flat
++    url = ""
++    image_url = part.get("image_url")
++    if isinstance(image_url, dict):
++        url = str(image_url.get("url") or "")
++    dims = _png_dimensions(url) if url else None
++    if dims is None:
++        return _IMAGE_TOKENS_FALLBACK
++    width, height = dims
++    cells = -(-width // _VISION_PATCH_PIXELS) * -(-height // _VISION_PATCH_PIXELS)
++    return cells + _VISION_SENTINEL_TOKENS
++
++
++def _split_messages_for_estimate(
++    messages: list[dict[str, Any]],
++) -> tuple[list[dict[str, Any]], int]:
++    """Return (messages with image payloads replaced by a short placeholder,
++    total vision tokens). Originals are never mutated."""
++    image_tokens = 0
++    rewritten: list[dict[str, Any]] = []
++    for message in messages:
++        content = message.get("content")
++        if not isinstance(content, list):
++            rewritten.append(message)
++            continue
++        parts: list[Any] = []
++        for part in content:
++            if isinstance(part, dict) and part.get("type") == "image_url":
++                image_tokens += _image_part_tokens(part)
++                parts.append({"type": "image_url", "image_url": {"url": "<image>"}})
++            else:
++                parts.append(part)
++        rewritten.append({**message, "content": parts})
++    return rewritten, image_tokens
+ 
+ 
+-def _estimate_tokens(value: Any) -> int:
++def _estimate_tokens(value: Any, chars_per_token: float | None = None) -> int:
+     try:
+-        rendered = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
++        # ensure_ascii=False is deliberate: with escaping ON, every non-ASCII
++        # character renders as a six-character \uXXXX sequence, so any prompt
++        # containing arrows, box-drawing glyphs or a multiplication sign is
++        # counted at up to 6x its real size. The trimmer decides when to evict
++        # in these units, so the inflation makes it discard history it did not
++        # need to - and the error grows with the share of non-ASCII text.
++        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+     except TypeError:
+         rendered = str(value)
+-    return max(1, (len(rendered) + 2) // 3)
++    chars = chars_per_token or _text_token_chars()
++    return max(1, int(len(rendered) / chars) + (1 if len(rendered) % chars else 0))
+ 
+ 
+ def _host_accessible_base_url(base_url: str) -> str:
+@@ -785,20 +3327,29 @@ def _append_request_snapshot(
+     event: str | None = None,
+     tool_choice: str | None = None,
+     finish_reason: str | None = None,
++    served_by: str | None = None,
+     analysis_step: int | None = None,
+     action: int | None = None,
+     request_index_within_turn: int | None = None,
++    usage: dict[str, Any] | None = None,
++    chat_template_kwargs: dict[str, Any] | None = None,
+ ) -> None:
+     payload = {
+         "messages": messages,
+         "tools": tools or [],
+     }
++    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs:
++        payload["chat_template_kwargs"] = dict(chat_template_kwargs)
++    if isinstance(usage, dict) and usage:
++        payload["usage"] = usage
+     if event:
+         payload["event"] = event
+     if tool_choice:
+         payload["tool_choice"] = tool_choice
+     if finish_reason is not None:
+         payload["finish_reason"] = str(finish_reason)
++    if served_by:
++        payload["served_by"] = str(served_by)
+     if analysis_step is not None:
+         payload["analysis_step"] = analysis_step
+     if action is not None:
+@@ -885,9 +3436,13 @@ def _extract_reasoning_text(message: dict[str, Any]) -> str:
+ 
+ 
+ def _is_context_length_error(exc: BaseException) -> bool:
+-    message = str(exc).lower()
++    message = str(exc).lower().replace("\u2019", "'")
+     return (
+         "maximum context length" in message
++        # SGLang reports an oversized prompt with this wording instead of
++        # "maximum context length". Route it through the same drain/retry path.
++        or "is longer than the model's context length" in message
++        or "context_length_exceeded" in message
+         or "reduce the length of the input prompt" in message
+         or "parameter=input_tokens" in message
+         or '"param":"input_tokens"' in message
+@@ -899,6 +3454,7 @@ class _ChatCompletionResult:
+     message: dict[str, Any]
+     finish_reason: str = ""
+     usage: dict[str, Any] | None = None
++    served_by: str = ""
+ 
+ 
+ class ToolAgent:
+@@ -910,6 +3466,7 @@ class ToolAgent:
+         model: str = _DEFAULT_ANALYZER_MODEL,
+         timeout: Optional[float] = None,
+         save_request_logs: bool = False,
++        dispatch_index: int = 0,
+         api_key: str | None = None,
+         base_url: str | None = None,
+         provider: str | None = None,
+@@ -932,6 +3489,10 @@ class ToolAgent:
+         self._tool_steps = None if _LOCAL_ANALYZER_TOOL_STEPS <= 0 else max(1, _LOCAL_ANALYZER_TOOL_STEPS)
+         self._python_timeout = min(30, max(1, _LOCAL_ANALYZER_TOOL_TIMEOUT))
+         self._yield_seconds = None if _LOCAL_ANALYZER_YIELD_SECONDS <= 0 else float(_LOCAL_ANALYZER_YIELD_SECONDS)
++        self._yield_tokens = (
++            None if _LOCAL_ANALYZER_YIELD_TOKENS <= 0 else int(_LOCAL_ANALYZER_YIELD_TOKENS)
++        )
++        self._turn_generated_tokens = 0
+         configured_max_output = _LOCAL_ANALYZER_MAX_OUTPUT
+         self._max_output_tokens = None if configured_max_output <= 0 else max(1, configured_max_output)
+         self._reply_reserve_tokens = self._max_output_tokens or 512
+@@ -946,6 +3507,75 @@ class ToolAgent:
+             1024,
+             _LOCAL_ANALYZER_CONTEXT_WINDOW - self._reply_reserve_tokens - self._request_safety_margin_tokens,
+         )
++        self._turns_without_wm_update = 0
++        self._pending_wm_rebuild_reason = ""
++        self._wm_absorbed_in_turn = False
++        self._auto_diff_prev_frame: Frame | None = None
++        self._pending_diff_image: dict[str, Any] | None = None
++        self._context_was_trimmed = False
++        self._has_evicted = False
++        self._actions_at_level_start = 0
++        self._tokens_at_level_start = 0
++        self._progress_pace = ProgressPace()
++        self._pace_last_completed_level = 0
++        # queue position spreads the untrimmed band so games do not tie
++        self._diag_name = f"g{int(dispatch_index):02d}"
++        self._game_elapsed_seconds: float | None = None
++        self._endgame_announced = False
++        self._priority_current = _PRIORITY_UNTRIMMED_BASE - max(0, int(dispatch_index))
++        self._priority_next = self._priority_current
++        self._kept_functions: dict[str, str] = {}
++        self._last_animation_chain: list[Any] = []
++        self._last_action_gameplay_changed: bool | None = None
++        self._pending_animation_image: dict[str, Any] | None = None
++        self._pending_animation_image_label: str = ""
++        self._pending_diff_image_label: str = ""
++        self._turn_diff_image: dict[str, Any] | None = None
++        self._turn_diff_image_label: str = ""
++        self._pending_gameover_images: list[tuple[str, dict[str, Any]]] = []
++        self._noop_guard_pre_hash: str = ""
++        # (interior board hash, action signature) already run in THIS snippet.
++        # Written in _record_guard_observations, read in _action_guard_hook,
++        # cleared before each sandbox call - three sites, one lifetime.
++        self._summary_context_tokens_since_attempt = 0
++        self._http_initial_grace_used = False
++        self._repeat_state_seen: set[tuple[str, str]] = set()
++        # (state_hash, action_sig) for each action the guard hook waved through,
++        # in execution order - the only place the intermediate board states of a
++        # batch are visible to the agent, since the solver reports outcomes per
++        # position but not the boards they ran against.
++        self._guard_hook_trace: list[tuple[str, str]] = []
++        self._rejected_section_updates: list[str] = []
++        # characters per token, measured from the last response; None until one
++        # arrives, and reported in the transcript whenever it changes
++        self._text_chars_per_token: float | None = None
++        # index into the reasoning-effort ladder; -1 means "server default"
++        self._reasoning_effort_rung: int = -1
++        self._guard_death_override_batch: bool = False
++        self._noop_guard_deaths_enabled: bool = _get_env_bool(
++            "ARC3_DEATH_REPEAT_GUARD", False
++        )
++        self._noop_repeat_guard: NoopRepeatGuard | None = (
++            NoopRepeatGuard()
++            if (
++                _get_env_bool("ARC3_NOOP_REPEAT_GUARD", False)
++                or self._noop_guard_deaths_enabled
++            )
++            else None
++        )
++        # only the no-op half is gated separately; the shared store is created
++        # when either half is enabled
++        self._noop_guard_noops_enabled: bool = _get_env_bool(
++            "ARC3_NOOP_REPEAT_GUARD", False
++        )
++        self._resume_after_yield: bool = False
++        self._resume_reason: str = ""
++        self._prev_level_start_frame: Frame | None = None
++        self._cur_level_start_frame: Frame | None = None
++        self._death_ledger_level: Any = None
++        self._death_ledger_attempts: list[dict[str, Any]] = []
++        self._death_ledger_index: dict[str, list[tuple[int, int]]] = {}
++        self._death_ledger_total: int = 0
+         self._history_messages: list[dict[str, Any]] = []
+         self._session_runtime_dir: Path | None = None
+         self._session_total_tokens = 0
+@@ -953,7 +3583,7 @@ class ToolAgent:
+         self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+         self._current_valid_actions: list[str] = []
+         self._last_step_summary: dict[str, Any] | None = None
+-        self._last_action_result: dict[str, Any] | None = None
++        self._last_action_call_result: dict[str, Any] | None = None
+         self._summarized_knowledge = _empty_world_model()
+ 
+     def _headers(self) -> dict[str, str]:
+@@ -976,12 +3606,20 @@ class ToolAgent:
+         runtime_dir = state_path.parent
+         if self._session_runtime_dir != runtime_dir:
+             self._session_runtime_dir = runtime_dir
++            self._priority_level_count_warned = False
++            if _persistent_functions():
++                self._kept_functions = {}
++                self._retained_clear_notice = ""
+             self._history_messages = []
+             self._session_total_tokens = 0
+             self._session_generated_tokens = 0
++            self._summary_context_tokens_since_attempt = 0
+             self._last_step_summary = None
+-            self._last_action_result = None
++            self._last_action_call_result = None
+             self._summarized_knowledge = _empty_world_model()
++            self._turns_without_wm_update = 0
++            self._pending_wm_rebuild_reason = ""
++            self._pending_wm_revise_reason = ""
+ 
+     @property
+     def total_tokens(self) -> int:
+@@ -991,7 +3629,19 @@ class ToolAgent:
+     def generated_tokens(self) -> int:
+         return max(0, int(self._session_generated_tokens))
+ 
+-    def _accumulate_usage_tokens(self, usage: dict[str, Any] | None) -> None:
++    def _accumulate_usage_tokens(
++        self, usage: dict[str, Any] | None, *, count_toward_turn: bool = True
++    ) -> None:
++        """Add a response's usage to the counters.
++
++        count_toward_turn=False for generation that is not part of the turn's
++        deliberation - the rolling summary. Its tokens are real GPU time and
++        belong in the session and per-game totals, or a summary-heavy run looks
++        cheaper than it is and gets more compute than
++        max_generated_tokens_per_game intends. But the per-turn yield budget
++        measures how long the model has been working on THIS turn, and charging
++        it for a summary would shorten whichever turn happened to follow one.
++        """
+         if not isinstance(usage, dict):
+             return
+         generated_token_count = 0
+@@ -1003,6 +3653,8 @@ class ToolAgent:
+             except (TypeError, ValueError):
+                 continue
+         self._session_generated_tokens += generated_token_count
++        if count_toward_turn:
++            self._turn_generated_tokens += generated_token_count
+ 
+         total_tokens = usage.get("total_tokens")
+         try:
+@@ -1021,6 +3673,41 @@ class ToolAgent:
+                 continue
+         self._session_total_tokens += token_count
+ 
++    @staticmethod
++    def _turn_action_trace(executed_results: list[dict[str, Any]]) -> list[str]:
++        """Stitch per-call action traces into one sequentially numbered
++        turn-level trace; synthesize entries for calls without a trace."""
++        entries: list[str] = []
++        for item in executed_results:
++            item_trace = item.get("action_trace")
++            if isinstance(item_trace, list) and item_trace:
++                entries.extend(
++                    re.sub(r"^\d+:\s*", "", str(line)) for line in item_trace
++                )
++                continue
++            names = item.get("executed_actions")
++            if not isinstance(names, list) or not names:
++                display = str(item.get("action_display") or "").strip()
++                names = [display] if display else []
++            if item.get("game_over"):
++                verdict = "GAME OVER (attempt ended immediately after this action)"
++            elif item.get("run_complete") or item.get("done"):
++                verdict = "RUN COMPLETE"
++            elif item.get("level_completed"):
++                verdict = "LEVEL COMPLETED"
++            elif item.get("gameplay_changed") is False:
++                verdict = (
++                    "NO-OP (executed, no change inside the board area)"
++                    if _new_noop_wording()
++                    else "NO-OP (executed, changed nothing)"
++                )
++            elif item.get("gameplay_changed") is True:
++                verdict = "effect"
++            else:
++                verdict = "executed"
++            entries.extend(f"{name} -> {verdict}" for name in names)
++        return [f"{position}: {entry}" for position, entry in enumerate(entries, 1)]
++
+     def _summarize_step_sequence(self, action_results: list[dict[str, Any]]) -> dict[str, Any] | None:
+         if not action_results:
+             return None
+@@ -1063,58 +3750,161 @@ class ToolAgent:
+             "level_transition": any(bool(item.get("level_completed")) for item in executed_results),
+             "run_complete": any(bool(item.get("run_complete")) for item in executed_results),
+             "game_over": any(bool(item.get("game_over")) for item in executed_results),
++            "game_over_trace": (
++                ToolAgent._turn_action_trace(executed_results)
++                if any(item.get("game_over") for item in executed_results)
++                else []
++            ),
++            "fatal_action": next(
++                (
++                    str(item.get("fatal_action") or item.get("action_display") or "")
++                    for item in executed_results
++                    if item.get("game_over")
++                ),
++                "",
++            ),
+             "board_changed": any(bool(item.get("board_changed")) for item in executed_results),
++            # the interior-only flag, so the opener can say WHICH kind of change
++            # happened instead of hedging over the broader one
++            "gameplay_changed": any(
++                bool(item.get("gameplay_changed")) for item in executed_results
++            ),
+             "stop_reason": last.get("stop_reason"),
++            "no_op_stops": [
++                {
++                    "action": item.get("no_op_action"),
++                    "index": item.get("no_op_action_index"),
++                    "skipped": item.get("skipped_actions") or [],
++                    "trace": item.get("action_trace") or [],
++                }
++                for item in executed_results
++                if item.get("stop_reason") == "no_op_action"
++            ],
++            # the animation of the last executed action, which is what
++            # last_animation_frames / last_animation_timeline will return when asked
++            "animation": (executed_results[-1].get("animation") if executed_results else None),
++            "animation_action": (
++                executed_results[-1].get("action_display") if executed_results else None
++            ),
++            "guard_stops": [
++                {
++                    "kind": item.get("stop_reason"),
++                    "action": item.get("blocked_action"),
++                    "detail": item.get("stop_detail"),
++                    "skipped": item.get("skipped_actions") or [],
++                    "trace": item.get("action_trace") or [],
++                }
++                # scans ALL results, not just executed ones: a refusal has
++                # executed=False by construction and is filtered out of
++                # executed_results before this point
++                for item in action_results
++                if item.get("stop_reason") in ("known_noop", "known_death", "stale_state")
++            ],
+         }
+ 
+-    def _describe_last_outcome(self, summary: dict[str, Any] | None) -> str:
+-        if not summary:
+-            return ""
+-        span = _format_action_span(
+-            summary.get("start_action_num"),
+-            summary.get("end_action_num"),
+-        )
+-        count = summary.get("executed_count")
+-        prefix = "Last executed sequence"
+-        if span and count:
+-            prefix = f"Actions {span} ({count} total)"
+-        elif span:
+-            prefix = f"Action span {span}"
+-        elif count:
+-            prefix = f"Last executed sequence ({count} total)"
++    # _describe_last_outcome removed. It built an outcome sentence and was
++    # called from nowhere - in this harness AND upstream - so neither its
++    # wording nor the fallback it carried ever reached a transcript. Two
++    # patches were spent revising text no model ever read. What it uniquely
++    # provided is now rendered inline in _build_user_prompt.
+ 
+-        level = summary.get("level")
+-        if summary.get("level_transition"):
+-            level_text = f" to level {level}" if level is not None else ""
+-            return f"{prefix} triggered a level transition{level_text}; re-ground on the new scene."
+-        if summary.get("run_complete"):
+-            return f"{prefix} completed the run."
+-        if summary.get("game_over"):
+-            return f"{prefix} reached GAME_OVER."
+-
+-        pieces = [prefix]
+-        if summary.get("board_changed"):
+-            pieces.append("produced a board change; verify that it affected gameplay objects rather than only HUD elements.")
+-        else:
+-            pieces.append("did not show a confirmed board change; treat this as weak evidence until verified.")
+-        stop_reason = _normalize_summary_text(summary.get("stop_reason"))
+-        if stop_reason:
+-            pieces.append(f"stop_reason={stop_reason}.")
+-        return " ".join(pieces)
+-
+-    def _update_summarized_knowledge_from_assistant(self, content: str) -> None:
+-        note = _extract_scientist_note(content)
++    def _update_summarized_knowledge_from_assistant(self, content: str) -> list[str]:
++        if _memory_sections_disabled():
++            # nothing is carried or shown, so parsing would only build state
++            # that never reaches the model
++            return []
++        note = _extract_scientist_note(content, self._summarized_knowledge)
+         if not note:
+-            return
++            return []
++        updated: list[str] = []
++        rejected: list[str] = []
+         for key, value in note.items():
+-            if value:
+-                self._summarized_knowledge[key] = value
++            if not value:
++                continue
++            if _is_degenerate_text(value):
++                # keep the previous version rather than truncating: a truncated
++                # degenerate section is still degenerate, and it would be
++                # re-injected into every later prompt
++                rejected.append(key)
++                continue
++            self._summarized_knowledge[key] = value
++            updated.append(key)
++        if rejected:
++            self._rejected_section_updates = sorted(set(rejected))
++            log.warning(
++                "rejected degenerate memory section update(s): %s",
++                ", ".join(self._rejected_section_updates),
++            )
++        if updated:
++            self._turns_without_wm_update = 0
++            self._wm_absorbed_in_turn = True
++            if "world_model" in updated:
++                self._pending_wm_rebuild_reason = ""
++            if "world_model" in updated or "current_plan" in updated:
++                self._pending_wm_revise_reason = ""
++        return updated
+ 
+     def _update_summarized_knowledge_from_step_summary(self) -> None:
+         summary = self._last_step_summary
+         if not summary:
+             return
+-        if summary.get("level_transition") or summary.get("run_complete") or summary.get("game_over"):
++        wipe_reason = ""
++        revise_reason = ""
++        if summary.get("level_transition"):
++            # the priority estimate is per level, so both counts restart here
++            if _get_env_bool("ARC3_PRIORITY_PACE", False):
++                completed_level = max(1, int(summary.get("level") or 2) - 1)
++                if completed_level > self._pace_last_completed_level:
++                    self._progress_pace.record_completion(
++                        self._session_generated_tokens - self._tokens_at_level_start,
++                        _pace_reference_tokens(completed_level),
++                    )
++                    self._pace_last_completed_level = completed_level
++            self._actions_at_level_start = _priority_action_count(summary)
++            self._tokens_at_level_start = self._session_generated_tokens
++        if summary.get("level_transition") and _persistent_functions_scope() == "levelup":
++            # a helper can encode the old layout in its code even when it holds
++            # no stale data, so the level boundary is where it stops being safe
++            self._kept_functions = {}
++            if _persistent_functions():
++                self._retained_clear_notice = (
++                    "Your retained functions were cleared at this level transition. "
++                    "Redefine any helpers you still need after checking their assumptions "
++                    "against the new board."
++                )
++        elif (
++            summary.get("level_transition")
++            and _persistent_functions_scope() == "game"
++            and _persistent_functions()
++            and getattr(self, "_kept_functions", None)
++        ):
++            self._retained_clear_notice = (
++                "Your retained functions remain available from previous levels. "
++                "Check level-specific assumptions against the new board before reusing them."
++            )
++        if summary.get("level_transition"):
++            # read at call time (not a module constant) so this patch's hunks
++            # stay clear of the env-knob block that other patches extend
++            if _get_env_int("ARC3_WM_WIPE_ON_LEVEL", 1):
++                wipe_reason = "a level transition"
++            else:
++                revise_reason = "level"
++        elif summary.get("run_complete"):
++            wipe_reason = "run completion"
++        elif summary.get("game_over"):
++            if _WM_WIPE_ON_GAME_OVER:
++                wipe_reason = "a game over"
++            else:
++                revise_reason = "death"
++        if revise_reason:
++            self._pending_wm_revise_reason = revise_reason
++            self._wm_revise_hint_shown = False
++            # a newer keep-event supersedes any stale rebuild nag (and vice
++            # versa below): at most one pending nudge, always for the latest event
++            self._pending_wm_rebuild_reason = ""
++        if wipe_reason:
++            self._pending_wm_rebuild_reason = wipe_reason
++            self._pending_wm_revise_reason = ""
+             for key in (
+                 "world_model",
+                 "goal_model",
+@@ -1135,7 +3925,24 @@ class ToolAgent:
+             ("Plan", self._summarized_knowledge.get("current_plan", "")),
+             ("Cross-level notes", self._summarized_knowledge.get("cross_level_notes", "")),
+         ]
++        if _memory_sections_disabled():
++            return []
++        rejected = list(getattr(self, "_rejected_section_updates", []))
++        self._rejected_section_updates = []
++        allowed = _memory_section_labels()
++        if allowed is not None:
++            entries = [(label, value) for label, value in entries if label in allowed]
+         lines = [f"- {label}: {value}" for label, value in entries if value]
++        if rejected:
++            # without this the model sees its section unchanged and is likely to
++            # emit the same degenerate text again
++            lines.append(
++                "- NOTE: your last update to "
++                + ", ".join(f"`{name.replace('_', ' ')}`" for name in rejected)
++                + " was REJECTED as degenerate (highly repetitive or corrupted "
++                "text) and the previous version above was kept. Rewrite it "
++                "concisely in plain prose."
++            )
+         if not lines:
+             return []
+         return [

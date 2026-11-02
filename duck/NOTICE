@@ -1,0 +1,84 @@
+The Duck fork (duck/, scripts/build_duck_notebook.py, notebooks/duck/)
+=====================================================================
+
+Our own files here (duck/gate_cell.py, duck/standin_cell.py,
+scripts/build_duck_notebook.py, tests/test_build_duck_notebook.py) are
+MIT-0, like the rest of this repository (LICENSE).
+
+The notebook is a fork of other people's work. Every third-party part, and
+the licence it comes under:
+
+1. Daniel Franzen's ARC-AGI-3 Milestone 2 solution: the harness patch, the
+   sglang launcher cell and the rest of the notebook in
+   duck/upstream/arc-agi-3-milestone-2-solution.ipynb (pulled from the Kaggle
+   kernel dfranzen/arc-agi-3-milestone-2-solution on 2026-10-27, unchanged),
+   and its kernel-metadata.json. duck/harness/ holds the same harness patch
+   cut into consecutive pieces by scripts/build_duck_notebook.py, unchanged.
+   Licence: Apache-2.0, as published at github.com/da-fr/arc-agi-3-solution.
+   Changes we made are listed in docs/duck.md and made only by
+   scripts/build_duck_notebook.py; the upstream copy stays verbatim.
+
+2. Tufa Labs' Duck harness (Jeroen Cottaar and Tufa Labs; source
+   github.com/Tufalabs/duck-harness, commit 7652836 is the base of
+   Franzen's patch). It reaches the notebook only as the Kaggle dataset
+   dfranzen/taaf-kaggle-source-bundle-copy, an unchanged copy of the bundle
+   Tufa Labs shared publicly on Kaggle; it is attached as an input and never
+   copied into this repository.
+   Licence: shared publicly on Kaggle for this competition, and so deemed
+   OSI-licensed under competition rule 3.b.
+
+3. The ARC-AGI-3-Agents framework and the arc-agi / arcengine packages
+   (ARC Prize Foundation), used by the harness and installed from the
+   competition's own wheels at run time.
+   Licence: MIT.
+
+4. Pennyroyal, the offline sglang wheelhouse (sglang, uv, PyTorch, the
+   NVIDIA CUDA runtime wheels and their dependencies, plus the FR-Spec token
+   map), attached as the Kaggle dataset dfranzen/pennyroyal-v253 and never
+   copied here.
+   Licence: each wheel under its own licence (sglang Apache-2.0, uv
+   MIT/Apache-2.0, PyTorch BSD-3-Clause, NVIDIA CUDA wheels under the NVIDIA
+   CUDA EULA, which allows redistribution of the runtime). Kaggle lists the
+   dataset's own licence as "unknown".
+
+5. The model weights, attached as Kaggle model inputs and never copied into
+   this repository:
+   - Qwen3.8-Flash-Next by the Qwen team, in Intel's W4A16 AutoRound
+     quantization: dfranzen/intel-qwen3.8-flash-next-w4a16-autoround,
+     Transformers/default version 1.
+   - Albucino's quantized MTP draft checkpoint for speculative decoding:
+     dfranzen/albucino-qwen3-8-flash-next-drafter, Transformers/default
+     version 1.
+   - From variant V5 on, in place of the first: bottlecapai's ThinkingCap
+     fine-tune of Qwen3.8-Flash-Next, in the same W4A16 AutoRound
+     packaging: lamdang/thinkingcap-qwen3-8-flash-next-w4a16-autoround,
+     Transformers/default version 1 (Kaggle labels the instance
+     Apache 2.0).
+   Licence: Qwen Community License (the base model's licence, which all
+   these derivatives carry).
+
+6. The solved-level memory, duck/solved_level_memory.py, copied unchanged
+   from the public Kaggle notebook vickyfym/arc-agi-3-lalalia-final
+   (lalalia9, pulled 2026-10-27), which adapted it from rellik13 /
+   sirikilohit's Milestone 2 solution ("M85").
+   Licence: CC-BY 4.0, as the M85 write-up states; and, as code shared
+   publicly on Kaggle, deemed OSI-licensed under competition rule 3.b.
+   Attribution: lalalia9 (vickyfym), rellik13, sirikilohit.
+
+7. The D' priority scheduler, duck/d_prime_scheduler.py, copied unchanged
+   from cell 18 of the public Kaggle notebook yongjiehishi/arc3-duck-lab-t06
+   (pulled 2026-10-27), which ported it from shiiin9 / daydreamerthinks'
+   public notebook affectify-arc-dfranzen-form-d1.
+   Licence: CC-BY 4.0, as the t06 notebook states; and, as code shared
+   publicly on Kaggle, deemed OSI-licensed under competition rule 3.b.
+   Attribution: yongjiehishi, shiiin9, daydreamerthinks.
+
+8. The S9 cells in duck/public/ (s9_harness_fixes.py, s9_reset_cond.py,
+   s9_inference_audit.py, s9_priority_flags.py), copied unchanged from cells
+   5, 6, 20 and 22 of the public Kaggle notebook ondrewsha/arc-agi-3-stack-s9
+   (pulled 2026-10-28), with our header added; used by the public-s9 and
+   public-audit variants.
+   Licence: the notebook states none. It builds on Franzen's notebook
+   (item 1, Apache-2.0), and as code shared publicly on Kaggle it is deemed
+   OSI-licensed under competition rule 3.b.
+   Attribution: ondrewsha.

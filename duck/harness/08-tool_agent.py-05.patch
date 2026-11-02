@@ -1,0 +1,876 @@
+@@ -1144,19 +3951,857 @@ class ToolAgent:
+             "- Revise any item above immediately if `current_frame` or `history` contradicts it.",
+         ]
+ 
++    def _prepare_auto_diff(
++        self,
++        current_frame: Frame | None,
++        previous_step_summary: dict[str, Any] | None,
++    ) -> list[str]:
++        """Track the frame shown at the previous analyzer turn and, when
++        enabled, produce the auto-injected frame-diff lines and/or the diff
++        image for the outgoing user message. Suppressed on the first turn and
++        on the turn after a game over (the auto-RESET makes that span
++        meaningless)."""
++        if not (_AUTO_FRAME_DIFF or _DIFF_IMAGE or _level_inventory_enabled()):
++            return []
++        # Imported lazily so this patch's hunks stay clear of the module
++        # import header, which other optional patches also modify.
++        from inference.agent.vision_context import diff_image_part
++        from inference.utils.frame_diff import compute_frame_diff
++        from inference.utils.grid_utils import ARC_COLOR_CHARS
++        from inference.utils.segmentation import segment_layer
++        self._pending_diff_image = None
++        self._pending_diff_image_label = ""
++        # a new opener supersedes the previous turn's diff whether or not it
++        # produces one of its own
++        self._turn_diff_image = None
++        self._turn_diff_image_label = ""
++        if current_frame is None:
++            return []
++        previous_frame = self._auto_diff_prev_frame
++        self._auto_diff_prev_frame = current_frame
++        if previous_frame is None:
++            self._cur_level_start_frame = current_frame
++            return []
++        prev_level = getattr(previous_frame, "level", None)
++        cur_level = getattr(current_frame, "level", None)
++        level_changed = (
++            prev_level is not None
++            and cur_level is not None
++            and prev_level != cur_level
++        )
++        if level_changed:
++            # shift the per-level start frames even when a game over follows:
++            # the current frame is this level's (near-)initial board
++            self._prev_level_start_frame = self._cur_level_start_frame
++            self._cur_level_start_frame = current_frame
++        if previous_step_summary and previous_step_summary.get("game_over"):
++            return []
++        if level_changed:
++            if not _level_inventory_enabled():
++                # still clear the diff image: a cross-level diff has no meaning
++                self._pending_diff_image = None
++                self._pending_diff_image_label = ""
++                return []
++            return self._level_transition_diff_lines(
++                current_frame, previous_step_summary
++            )
++        if not (_AUTO_FRAME_DIFF or _DIFF_IMAGE):
++            # reached only when the inventory knob alone kept us here
++            return []
++        prev_step = getattr(previous_frame, "step", None)
++        cur_step = getattr(current_frame, "step", None)
++        span = f"step {prev_step} -> {cur_step}"
++        if _DIFF_IMAGE:
++            part = diff_image_part(previous_frame, current_frame)
++            if part is not None and previous_frame.grid != current_frame.grid:
++                label = (
++                    f"Diff image ({span}): cells that changed since your previous "
++                    "analyzer turn in their new true color; unchanged cells dimmed "
++                    "to dark navy (an off-palette color)."
++                )
++                self._pending_diff_image = part
++                self._pending_diff_image_label = label
++                # kept beyond the single use above so a resumption can re-show
++                # it; replaced whenever a new opener produces a fresh diff, so
++                # a stale one from an earlier turn can never leak in
++                self._turn_diff_image = part
++                self._turn_diff_image_label = label
++        if not _AUTO_FRAME_DIFF:
++            return []
++        executed = 0
++        if previous_step_summary and not previous_step_summary.get("stale"):
++            # a stale summary describes an earlier exchange whose changes were
++            # already diffed then; nothing has executed since, so don't claim
++            # "no cell changed despite N executed actions"
++            try:
++                executed = int(previous_step_summary.get("executed_count") or 0)
++            except (TypeError, ValueError):
++                executed = 0
++        if previous_frame.grid == current_frame.grid:
++            if executed > 0:
++                return [
++                    f"Auto frame diff ({span}): no cell changed since your previous "
++                    f"analyzer turn despite {executed} executed action(s)."
++                ]
++            return []
++        prev_rows = len(previous_frame.grid)
++        cur_rows = len(current_frame.grid)
++        prev_cols = max((len(r) for r in previous_frame.grid), default=0)
++        cur_cols = max((len(r) for r in current_frame.grid), default=0)
++        if (prev_rows, prev_cols) != (cur_rows, cur_cols):
++            return [
++                f"Auto frame diff ({span}): grid shape changed "
++                f"({prev_rows}x{prev_cols} -> {cur_rows}x{cur_cols}); diff skipped."
++            ]
++        diff = compute_frame_diff(
++            previous_frame.grid,
++            current_frame.grid,
++            segment_layer(previous_frame.grid, ARC_COLOR_CHARS).get("nodes", []),
++            segment_layer(current_frame.grid, ARC_COLOR_CHARS).get("nodes", []),
++            max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
++        )
++        rendered = _render_auto_frame_diff(
++            diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=cur_rows * cur_cols
++        )
++        lines = [
++            f"Auto frame diff ({span}; covers everything since your previous "
++            "analyzer turn, not just the last action):"
++        ]
++        lines.extend(rendered)
++        return lines
++
++    def _death_ledger_record(self, history_entries: list["HistoryEntry"]) -> None:
++        entries = list(history_entries or [])
++        if len(entries) < 2 or str(entries[-1].action or "").upper() != "RESET":
++            return
++        death_idx = len(entries) - 2
++        death = entries[death_idx]
++        if death.frame is None or str(death.action or "").upper() == "RESET":
++            return
++        death_level = getattr(death.frame, "level", None)
++        if (
++            self._death_ledger_level is not None
++            and death_level is not None
++            and death_level != self._death_ledger_level
++        ):
++            self._death_ledger_attempts = []
++            self._death_ledger_index = {}
++        if death_level is not None:
++            self._death_ledger_level = death_level
++        start_idx = None
++        for idx in range(death_idx - 1, -1, -1):
++            entry = entries[idx]
++            if str(entry.action or "").upper() == "RESET":
++                start_idx = idx
++                break
++            level = (
++                getattr(entry.frame, "level", None)
++                if entry.frame is not None
++                else None
++            )
++            if (
++                death_level is not None
++                and level is not None
++                and level != death_level
++            ):
++                start_idx = idx + 1
++                break
++        partial = start_idx is None
++        if partial:
++            start_idx = 0
++        actions = [
++            str(entries[i].action) for i in range(start_idx + 1, death_idx + 1)
++        ]
++        frames = [entries[i].frame for i in range(start_idx, death_idx)]
++        trim = 0
++        for i in range(len(frames) - 1, -1, -1):
++            if frames[i] is None:
++                trim = i + 1
++                break
++        if trim:
++            frames = frames[trim:]
++            actions = actions[trim:]
++            partial = True
++        if not actions or len(frames) != len(actions):
++            return
++        for item in self._death_ledger_attempts:
++            if item["actions"] == actions:
++                self._death_ledger_total += 1
++                item["ids"].append(self._death_ledger_total)
++                return
++        self._death_ledger_total += 1
++        uidx = len(self._death_ledger_attempts)
++        hashes = [_interior_state_hash(f.grid) for f in frames]
++        self._death_ledger_attempts.append(
++            {
++                "actions": actions,
++                "hashes": hashes,
++                "ids": [self._death_ledger_total],
++                "partial": partial,
++            }
++        )
++        for pos, state_hash in enumerate(hashes):
++            self._death_ledger_index.setdefault(state_hash, []).append((uidx, pos))
++
++    def _death_ledger_payload(self) -> dict[str, Any]:
++        return {
++            "level": self._death_ledger_level,
++            "attempts": [
++                {
++                    "actions": list(item["actions"]),
++                    "state_hashes": list(item["hashes"]),
++                    "attempt_ids": list(item["ids"]),
++                    "partial": bool(item.get("partial")),
++                }
++                for item in self._death_ledger_attempts
++            ],
++        }
++
++    def _death_ledger_observe(
++        self,
++        history_entries: list["HistoryEntry"],
++        previous_step_summary: dict[str, Any] | None,
++    ) -> None:
++        """Record a death, if the previous sequence ended in one.
++
++        Called unconditionally rather than from the rendering path. The ledger
++        has TWO consumers - the advisory lines under ARC3_DEATH_LEDGER, and the
++        death guard's fatal lookup under ARC3_DEATH_REPEAT_GUARD - and the
++        recorder used to live inside the first. So enabling only the guard left
++        it consulting an index nothing ever wrote to: armed, checked, always
++        empty, every repeat of a fatal route allowed through. Observed as three
++        identical deaths in a row with the guard on.
++        """
++        if not (
++            previous_step_summary
++            and previous_step_summary.get("game_over")
++            and not previous_step_summary.get("stale")
++        ):
++            return
++        if not (
++            _get_env_bool("ARC3_DEATH_LEDGER", False)
++            or _get_env_bool("ARC3_DEATH_REPEAT_GUARD", False)
++        ):
++            # nothing reads it; skip the work rather than accumulate state
++            return
++        self._death_ledger_record(history_entries)
++
++    def _death_ledger_lines(
++        self,
++        current_frame: Frame | None,
++        history_entries: list["HistoryEntry"],
++        previous_step_summary: dict[str, Any] | None,
++    ) -> list[str]:
++        """Advisory display of recorded fatal continuations matching the
++        CURRENT interior state. Broad by design (bar/items may not be visible
++        in the interior), hence advisory phrasing; exact-sequence enforcement
++        is a separate concern."""
++        if current_frame is None:
++            return []
++        level = getattr(current_frame, "level", None)
++        if (
++            self._death_ledger_level is not None
++            and level is not None
++            and level != self._death_ledger_level
++        ):
++            self._death_ledger_attempts = []
++            self._death_ledger_index = {}
++            self._death_ledger_level = level
++        if not self._death_ledger_attempts:
++            return []
++        state_hash = _interior_state_hash(current_frame.grid)
++        matches: dict[int, int] = {}
++        for uidx, pos in self._death_ledger_index.get(state_hash, []):
++            matches[uidx] = max(matches.get(uidx, -1), pos)
++        if not matches:
++            return []
++        by_suffix: dict[tuple, list[int]] = {}
++        for uidx, pos in matches.items():
++            item = self._death_ledger_attempts[uidx]
++            suffix = tuple(item["actions"][pos:])
++            by_suffix.setdefault(suffix, []).extend(item["ids"])
++        ordered = sorted(by_suffix.items(), key=lambda kv: len(kv[0]))
++        total_deaths = sum(
++            len(item["ids"]) for item in self._death_ledger_attempts
++        )
++        lines = [
++            "Known fatal continuations FROM THE CURRENT BOARD STATE (this "
++            f"level has {total_deaths} failed attempt(s) recorded; the game "
++            "is deterministic):"
++        ]
++        for suffix, ids in ordered[:3]:
++            shown = ", ".join(suffix[:12]) + (", ..." if len(suffix) > 12 else "")
++            id_text = ", ".join(str(i) for i in sorted(set(ids)))
++            lines.append(
++                f"- {len(suffix)} action(s): {shown} -> GAME OVER "
++                f"(attempt(s) {id_text})"
++            )
++        if len(ordered) > 3:
++            lines.append(
++                f"- +{len(ordered) - 3} more matching fatal continuation(s)"
++            )
++        lines.append(
++            "Do NOT replay a listed continuation exactly - vary the route or "
++            "action at or before its first step. (Advisory: fatality can "
++            "depend on state not visible in the board interior, e.g. bar "
++            "level or held items; if you are certain the situation differs, "
++            "state why before proceeding.) The full ledger is available in "
++            "python as `death_ledger`."
++        )
++        return lines
++
++    def _level_transition_diff_lines(
++        self,
++        current_frame: Frame | None,
++        previous_step_summary: dict[str, Any] | None,
++    ) -> list[str]:
++        """First prompt of a new level: acknowledge the completing action and
++        render a START-vs-START inventory against the previous level instead
++        of the meaningless end-of-old-board vs new-board diff. The diff image
++        is suppressed for this prompt (no cross-level semantics)."""
++        from inference.utils.frame_diff import compute_frame_diff
++        from inference.utils.grid_utils import ARC_COLOR_CHARS
++        from inference.utils.segmentation import segment_layer
++
++        self._pending_diff_image = None
++        self._pending_diff_image_label = ""
++        lines: list[str] = []
++        final_action = ""
++        if previous_step_summary and not previous_step_summary.get("stale"):
++            actions = previous_step_summary.get("executed_actions")
++            if isinstance(actions, list) and actions:
++                final_action = str(actions[-1]).strip()
++        lines.append(
++            "Level completed - the board was replaced, so no object diff is "
++            "shown across the boundary"
++            + (f" (the final action {final_action!r} finished the level)" if final_action else "")
++            + "."
++        )
++        prev_start = self._prev_level_start_frame
++        cur_start = self._cur_level_start_frame
++        if prev_start is None or cur_start is None:
++            return lines
++        grid_a, grid_b = prev_start.grid, cur_start.grid
++        rows = len(grid_b)
++        cols = max((len(r) for r in grid_b), default=0)
++        if len(grid_a) != rows or max(
++            (len(r) for r in grid_a), default=0
++        ) != cols:
++            lines.append(
++                "New level inventory skipped (boards have different shapes)."
++            )
++            return lines
++        diff = compute_frame_diff(
++            grid_a,
++            grid_b,
++            segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", []),
++            segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", []),
++            max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
++        )
++        lines.append(
++            "New level inventory (previous level START vs this level START; "
++            "read it as a TYPE comparison, not motion: 'moved' = object types "
++            "recurring from the previous level at a new spot, 'appeared' = "
++            "types NOT present on the previous level - likely new mechanics, "
++            "investigate these first, 'disappeared' = previous types absent "
++            "here; identical objects at identical positions are not listed):"
++        )
++        lines.extend(
++            _render_auto_frame_diff(
++                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols
++            )
++        )
++        return lines
++
++    def _prepare_gameover_images(
++        self,
++        history_entries: list["HistoryEntry"],
++        previous_step_summary: dict[str, Any] | None = None,
++    ) -> None:
++        """Queue the death-turn visuals (ARC3_GAMEOVER_DIFF_IMAGE).
++
++        The auto-diff - and with it the diff image - is suppressed after a game
++        over because the auto-RESET makes that span meaningless, so the visual
++        slot is idle on exactly the turn where the death is invisible: the
++        board the model sees has already been reset. Two parts fill it:
++
++          1. the death frame itself (the budget bar in it is what the BAR RULE
++             asks about, and it exists nowhere else in the message), and
++          2. a change-highlight diff of the killing action (last alive frame ->
++             death frame), the spatial form of the textual 'Fatal step diff'.
++
++        Anchoring matches _game_over_diff_lines: history ends with the RESET
++        marker, entries[-2] is the death frame, entries[-3] the last alive one.
++        """
++        self._pending_gameover_images = []
++        if not _get_env_bool("ARC3_GAMEOVER_DIFF_IMAGE", False):
++            return
++        from inference.agent.vision_context import (
++            current_grid_image_part,
++            diff_image_part,
++        )
++
++        entries = list(history_entries or [])
++        if len(entries) < 3 or str(entries[-1].action or "").upper() != "RESET":
++            return
++        death = entries[-2]
++        last_alive = entries[-3]
++        if death.frame is None or str(death.action or "").upper() == "RESET":
++            return
++        death_part = current_grid_image_part(death.frame)
++        if death_part is not None:
++            self._pending_gameover_images.append(
++                (
++                    "Death frame image (the board at the moment the attempt "
++                    "ended, before the automatic reset): inspect the budget bar "
++                    "here for the BAR RULE.",
++                    death_part,
++                )
++            )
++        self._append_fatal_animation_image(previous_step_summary)
++        if last_alive.frame is None:
++            return
++        fatal_part = diff_image_part(last_alive.frame, death.frame)
++        if fatal_part is not None and last_alive.frame.grid != death.frame.grid:
++            self._pending_gameover_images.append(
++                (
++                    "Fatal step diff image (last alive frame -> death frame): "
++                    "cells changed by the killing action in their new true "
++                    "color; unchanged cells dimmed to dark navy (an off-palette "
++                    "color).",
++                    fatal_part,
++                )
++            )
++
++    def _game_over_diff_lines(
++        self,
++        history_entries: list["HistoryEntry"],
++        previous_step_summary: dict[str, Any] | None = None,
++    ) -> list[str]:
++        """After a game over (fresh rendering only), push two diffs over the
++        fatal sequence itself: sequence progress (frame before the sequence's
++        first action -> last alive frame, omitted when fewer than two actions
++        executed) and the fatal step (last alive -> death frame). Anchored by
++        the summary's executed_count - the turns before the fatal sequence
++        already delivered their own diffs while the model was alive."""
++        from inference.utils.frame_diff import compute_frame_diff
++        from inference.utils.grid_utils import ARC_COLOR_CHARS
++        from inference.utils.segmentation import segment_layer
++
++        entries = list(history_entries or [])
++        if len(entries) < 2 or str(entries[-1].action or "").upper() != "RESET":
++            return []
++        death_idx = len(entries) - 2
++        death = entries[death_idx]
++        if death.frame is None or str(death.action or "").upper() == "RESET":
++            return []
++        executed = 0
++        if previous_step_summary:
++            try:
++                executed = int(previous_step_summary.get("executed_count") or 0)
++            except (TypeError, ValueError):
++                executed = 0
++        if executed < 1:
++            executed = 1
++        start_idx = death_idx - executed
++        partial = start_idx < 0
++        if partial:
++            start_idx = 0
++        origin = "earliest retained frame" if partial else "sequence start"
++        death_level = getattr(death.frame, "level", None)
++        while start_idx < death_idx - 1:
++            frame = entries[start_idx].frame
++            level = getattr(frame, "level", None) if frame is not None else None
++            if (
++                frame is None
++                or (
++                    death_level is not None
++                    and level is not None
++                    and level != death_level
++                )
++            ):
++                # the sequence itself crossed a level-up (or a frame is
++                # missing); anchor at the first same-level frame within it
++                start_idx += 1
++                origin = "level start within the sequence"
++                continue
++            break
++        start = entries[start_idx]
++        last_alive = entries[death_idx - 1]
++        if start.frame is None or last_alive.frame is None:
++            return []
++
++        def _diff_lines(frame_a, frame_b, label: str) -> list[str]:
++            grid_a, grid_b = frame_a.grid, frame_b.grid
++            rows = len(grid_b)
++            cols = max((len(r) for r in grid_b), default=0)
++            if len(grid_a) != rows or max(
++                (len(r) for r in grid_a), default=0
++            ) != cols:
++                return [f"{label} skipped (grid shape changed)."]
++            diff = compute_frame_diff(
++                grid_a,
++                grid_b,
++                segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", []),
++                segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", []),
++                max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
++            )
++            rendered = _render_auto_frame_diff(
++                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols
++            )
++            return [label, *rendered]
++
++        out: list[str] = []
++        pre_death_actions = (death_idx - 1) - start_idx
++        if pre_death_actions >= 1:
++            out.extend(
++                _diff_lines(
++                    start.frame,
++                    last_alive.frame,
++                    f"Sequence progress diff ({origin} step "
++                    f"{getattr(start.frame, 'step', '?')} -> step "
++                    f"{getattr(last_alive.frame, 'step', '?')}, what the first "
++                    f"{pre_death_actions} action(s) of the fatal sequence "
++                    "changed - the reset reverted all of it):",
++                )
++            )
++        out.extend(
++            _diff_lines(
++                last_alive.frame,
++                death.frame,
++                f"Fatal step diff (step {getattr(last_alive.frame, 'step', '?')} "
++                f"-> step {getattr(death.frame, 'step', '?')}, what the killing "
++                f"action {str(death.action)!r} changed):",
++            )
++        )
++        return out
++
++    def _append_fatal_animation_image(self, summary: dict[str, Any] | None) -> None:
++        """An image of what the fatal action's animation hid, on a game over.
++
++        Gated on transient pixels alone, NOT on gameplay_changed: after a death
++        the board has already reset, so gameplay_changed compares the
++        pre-action board against the restarted level and is essentially always
++        true. The justification differs from the ordinary case too - there the
++        board shows nothing, here it shows a different board entirely, and
++        either way the fatal moment is unreachable.
++        """
++        if not _animation_enabled():
++            return
++        mode = animation_death_image_mode()
++        if mode == "off" or not summary:
++            return
++        animation = summary.get("animation") or {}
++        if not int(animation.get("transient_pixels") or 0):
++            return
++        chain = self._last_animation_chain or []
++        cells = _animation_transient_cells(chain)
++        if not cells:
++            return
++        if mode == "composite":
++            part = animation_composite_part(
++                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
++            )
++            label = (
++                "Fatal action animation image: the cells that changed during the fatal "
++                "action's animation, each in the last colour it held before reverting; "
++                "everything else, including the border, is dimmed to dark navy (an "
++                "off-palette colour). This is a composite of all cells that changed "
++                "during the animation, not a single board state that the game "
++                "displayed. A cell is drawn nearer its true colour the longer it held "
++                "it, so a bright trail marks where something stayed and a uniformly "
++                "dim one marks something that passed through. Neither the death frame "
++                "nor the last alive frame contains these cells - they existed only "
++                "between the two."
++            )
++        else:
++            part, index = animation_peak_part(chain, cells)
++            label = (
++                f"Fatal action animation image (frame {index} of {len(chain) - 1}): the "
++                "board partway through the fatal action's animation, at the point where "
++                "the most cells were showing something they later reverted. This is a "
++                "real state the game displayed, between the last alive frame and the "
++                "death frame."
++            )
++        if part is not None:
++            self._pending_gameover_images.append((label, part))
++
++    def _prepare_animation_image(self, summary: dict[str, Any] | None) -> None:
++        """Attach an image of what the animation hid, when the board did not move.
++
++        Gated on gameplay_changed being false: that is exactly when the board
++        image the model receives is uninformative, because the action did
++        something and no frame it can reach shows what. On any other turn the
++        current board already carries the outcome.
++        """
++        if not _animation_enabled():
++            # ARC3_ANIMATION_IMAGE needs ARC3_ANIMATION: without it no chain is
++            # captured, so this would silently do nothing. Stated rather than
++            # left implicit - a knob that quietly has no effect is the failure
++            # mode that costs the most time to diagnose.
++            return
++        mode = animation_image_mode()
++        if mode == "off" or not summary:
++            return
++        if self._last_action_gameplay_changed is not False:
++            return
++        animation = summary.get("animation") or {}
++        if not int(animation.get("transient_pixels") or 0):
++            return
++        chain = self._last_animation_chain or []
++        cells = _animation_transient_cells(chain)
++        if not cells:
++            return
++        if mode == "composite":
++            part = animation_composite_part(
++                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
++            )
++            label = (
++                "Animation image: the cells that changed during the animation, each in "
++                "the last colour it held before reverting; everything else, including "
++                "the border, is dimmed to dark navy (an off-palette colour). This is a "
++                "composite of all cells that changed during the animation, not a single "
++                "board state that the game displayed. A cell is drawn nearer its true "
++                "colour the longer it held it, so a bright trail marks where something "
++                "stayed and a uniformly dim one marks something that passed through. "
++                "The action left the board area unchanged, so none of these cells "
++                "appear in `current_frame`."
++            )
++        else:
++            part, index = animation_peak_part(chain, cells)
++            label = (
++                f"Animation image (frame {index} of {len(chain) - 1}): the board partway "
++                "through the animation, at the point where the most cells were showing "
++                "something they later reverted. This is a real state the game displayed, "
++                "but not one that survives into `current_frame`."
++            )
++        if part is not None:
++            self._pending_animation_image = part
++            self._pending_animation_image_label = label
++
++    def _retained_function_context(self) -> str:
++        """Optional prompt metadata must never interrupt game execution."""
++        if not _persistent_functions():
++            return ""
++        try:
++            notice = getattr(self, "_retained_clear_notice", "")
++            signatures = [function_signature(src) for src in self._kept_functions.values()]
++            parts = [notice] if notice else []
++            if signatures:
++                scope = {"levelup": "on this level", "turn": "in this turn", "game": "in this game"}[_persistent_functions_scope()]
++                parts.append(
++                    "Your retained functions from earlier Python calls " + scope + ": "
++                    + ", ".join(signatures) + ". These are your previous definitions, "
++                    "available to call directly. Their presence does not mean they are "
++                    "correct; revise them if new evidence contradicts their assumptions."
++                )
++            self._retained_clear_notice = ""
++            return "\n\n" + "\n".join(parts) if parts else ""
++        except Exception:
++            self._kept_functions = {}
++            self._retained_clear_notice = ""
++            return "\n\nYour retained functions were cleared after a retention error; redefine any you need."
++
++    def _retained_sources(self):
++        if not _persistent_functions():
++            return None
++        try:
++            return list(self._kept_functions.values())
++        except Exception:
++            self._kept_functions = {}
++            return []
++
++    def _record_retained_functions(self, sandbox_result, payload) -> None:
++        if not _persistent_functions():
++            return
++        try:
++            previous = self._kept_functions
++            kept = {}
++            signatures = {}
++            for item in sandbox_result.get("keepable_functions") or []:
++                name, source = item["name"], item["source"]
++                signature = function_signature(source)
++                if signature.split("(", 1)[0] != name:
++                    raise ValueError("invalid retained function metadata")
++                kept[name] = source
++                signatures[name] = signature
++            notes = []
++            scope = {"levelup": "on this level", "turn": "in this turn", "game": "in this game"}[_persistent_functions_scope()]
++            for name, source in kept.items():
++                if previous.get(name) != source:
++                    notes.append("Retained your function " + signatures[name] + " for later Python calls " + scope + ".")
++            rejected = sandbox_result.get("retention_rejected") or []
++            repair_hints = _get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False)
++            rejected_names = set()
++            seen_rejections = set()
++            for item in rejected:
++                name, reason = str(item["name"]), str(item["reason"])
++                hint = (str(item.get("hint") or "").strip() if repair_hints else
++                        "Pass snippet-specific data as arguments or redefine it if needed.")
++                rejection_key = (name, reason, hint)
++                if rejection_key in seen_rejections:
++                    continue
++                seen_rejections.add(rejection_key)
++                rejected_names.add(name)
++                if name == "all":
++                    notes.append("Your retained functions were cleared: " + reason + ".")
++                    continue
++                notes.append("Your function " + name + " was not retained: " + reason + "."
++                             + (" " + hint if hint else ""))
++            for name in previous.keys() - kept.keys() - rejected_names:
++                notes.append("Your previous function " + name + " is no longer retained; redefine it if needed.")
++            self._kept_functions = kept
++            if notes:
++                payload["function_retention"] = "\n".join(notes)
++        except Exception:
++            self._kept_functions = {}
++            payload["function_retention"] = "Your retained functions were cleared after a retention error; redefine any you need."
++
+     def _build_user_message(self, user_prompt: str, current_frame: Frame | None) -> dict[str, Any]:
++        user_prompt += self._retained_function_context()
+         image_part = current_grid_image_part(current_frame)
++        diff_part = self._pending_diff_image
++        diff_label = self._pending_diff_image_label
++        animation_part = self._pending_animation_image
++        animation_label = self._pending_animation_image_label
++        gameover_images = list(self._pending_gameover_images)
++        self._pending_diff_image = None
++        self._pending_diff_image_label = ""
++        self._pending_animation_image = None
++        self._pending_animation_image_label = ""
++        self._pending_gameover_images = []
++        if animation_part is not None:
++            # the animation image only ever fires when nothing inside the board
++            # moved, which is precisely when the diff image shows the ticking
++            # budget bar and nothing else - two images, one of them noise
++            diff_part = None
+         if image_part is None:
+             return {"role": "user", "content": user_prompt}
+ 
+-        return {
+-            "role": "user",
+-            "content": [
+-                {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image:"},
+-                image_part,
+-            ],
+-        }
++        content: list[dict[str, Any]] = [
++            {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
++            image_part,
++        ]
++        if diff_part is not None:
++            content.append({"type": "text", "text": diff_label})
++            content.append(diff_part)
++        if animation_part is not None:
++            content.append({"type": "text", "text": animation_label})
++            content.append(animation_part)
++        for label, part in gameover_images:
++            content.append({"type": "text", "text": label})
++            content.append(part)
++        return {"role": "user", "content": content}
++
++
++    def _memory_section_guidance(self, block_shown: bool) -> list[str]:
++        """The section explanation, in upstream's slot just before the tool-call
++        format guidance.
++
++        Returns nothing when the mechanic is off. In 'full' mode the wording
++        depends on whether a stored block was shown: the REPLACES warning is
++        meaningless when there is nothing stored to replace, so a first turn or
++        a post-wipe turn gets the format glossary without it."""
++        if _memory_sections_disabled():
++            return []
++        if _wm_section_explanation_mode() == "upstream":
++            return [_memory_section_guidance_upstream()]
++        if not block_shown:
++            return [_memory_section_guidance_empty()]
++        if _memory_section_labels() is None:
++            return [_MEMORY_SECTION_GUIDANCE_FULL]
++        # a mode carrying a subset needs the subset described, not the fixed
++        # two-section text: `medium` carries three
++        return [
++            _memory_section_guidance_empty()
++            + " IMPORTANT: each labeled section you write REPLACES the stored version shown "
++            "under 'Working world model carried from earlier turns' - write the COMPLETE "
++            "updated section; any fact you omit is permanently lost."
++        ]
++
++    @staticmethod
++    def _manual_reset_context_line(summary: dict[str, Any]) -> str | None:
++        if not reset_exposed() or any(summary.get(flag) for flag in (
++            "stale", "game_over", "run_complete", "done", "level_transition", "level_completed",
++        )):
++            return None
++        actions = [str(name).strip().upper() for name in summary.get("executed_actions") or []]
++        if "RESET" not in actions:
++            return None
++        if actions == ["RESET"]:
++            return (
++                "You deliberately reset the current level. The current frame shows "
++                "the state returned by RESET."
++            )
++        return (
++            "You deliberately reset the current level, then executed the subsequent "
++            "actions listed above. The current frame shows their resulting state."
++        )
++
++    def _summary_turn_context_lines(self) -> list[str]:
++        """What just happened, for the summary request.
+ 
++        Deliberately not _build_user_prompt: that consumes _pending_diff_image,
++        _pending_animation_image and the wipe-nudge state, so calling it twice
++        would swallow images the real opener should carry. This reads
++        _last_step_summary and mutates nothing - the stale flag is set by tool
++        dispatch, never by building a prompt, so an extra read is safe.
++        """
++        summary = self._last_step_summary
++        if not summary or summary.get("stale"):
++            # nothing executed since the last opener; the block would say
++            # "Executed actions: none" and repeat an unchanged state line
++            return []
++        lines: list[str] = []
++        count = summary.get("executed_count")
++        try:
++            normalized = int(count) if count is not None else None
++        except (TypeError, ValueError):
++            normalized = None
++        if not normalized:
++            return []
++        label = "action" if normalized == 1 else "actions"
++        lines.append(f"The code executed {normalized} {label} in the previous sequence.")
++        rendered = summary.get("executed_actions") or []
++        if rendered:
++            prefix = (
++                "Executed actions:" if len(rendered) <= 10
++                else "Executed actions (first 10):"
++            )
++            lines.append(f"{prefix} {', '.join(str(a) for a in rendered[:10])}.")
++        changed = summary.get("gameplay_changed")
++        if _report_gameplay_changed():
++            if changed is True:
++                lines.append("That sequence changed cells inside the board area.")
++            elif changed is False and summary.get("board_changed"):
++                lines.append(
++                    "That sequence changed only cells near the edge - nothing inside "
++                    "the board area moved."
++                )
++            elif changed is False:
++                lines.append("That sequence produced no change anywhere on the board.")
++        for stop in (summary.get("no_op_stops") or [])[:3]:
++            lines.append(
++                f"A batched sequence was stopped by the no-op guard: "
++                f"{stop.get('action')!r} executed but changed nothing, and "
++                f"{stop.get('skipped', 0)} later action(s) were skipped."
++            )
++        for stop in (summary.get("guard_stops") or [])[:3]:
++            lines.append(
++                f"The sequence was stopped before {stop.get('action')!r}: "
++                f"{stop.get('reason', 'a guard refused it')}."
++            )
++        if summary.get("level_completed"):
++            lines.append("You have progressed to a new level!")
++        elif summary.get("game_over"):
++            lines.append("The attempt ended and the level was reset.")
++        else:
++            lines.append(self._manual_reset_context_line(summary) or "You are still on the same level.")
++        step = summary.get("action_num")
++        level = summary.get("level")
++        if step is not None and level is not None:
++            lines.append(f"Current state: step {step}, level {level}.")
++        return lines
+ 
+     def _build_user_prompt(
+         self,
+@@ -1183,7 +4828,9 @@ class ToolAgent:
+             default=current_level,
+         )
+         lines: list[str] = []
+-        if previous_step_summary:
++        if previous_step_summary and previous_step_summary.get("stale"):
++            lines.extend(_stale_summary_lines(previous_step_summary))
++        elif previous_step_summary:
+             count = previous_step_summary.get("executed_count")
+             try:
+                 normalized_count = int(count) if count is not None else None

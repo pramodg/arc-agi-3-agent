@@ -1,0 +1,1049 @@
++    """Which wording explains the memory sections in the turn opener.
++
++    'tufa' (also spelled 'upstream', the default) is the terse original: one
++    sentence naming the prefixes, framed
++    as optional. 'full' (default) is ours - a glossary of what each section
++    means, a GOOD/BAD example, and the warning that a written section REPLACES
++    the stored one so an omitted fact is lost. Roughly 1100 characters against
++    250, every turn, and it asks for complete rewrites rather than short
++    updates - so it is a candidate for longer generations as well as better
++    memory."""
++    mode = os.environ.get("ARC3_WM_SECTION_EXPLANATION", "tufa").strip().lower()
++    return "full" if mode == "full" else "upstream"
++
++
++_MEMORY_SECTION_GUIDANCE_EMPTY = (
++    "You have no stored memory sections yet. If you include assistant text before a tool "
++    "call, use it to start them: `World model:` = durable RULES of the environment that will "
++    "still be true many actions from now (mechanics, what objects/colors mean, movement "
++    "rules, win conditions) - never current positions or what just happened. `Goal model:` = "
++    "what winning requires. `Action model:` = what each action does mechanically. `Recent "
++    "findings:` = this turn's observations. `Open questions:` = unresolved hypotheses. "
++    "`Plan:` = intended next steps. `Cross-level notes:` = knowledge that carries across "
++    "levels."
++)
++
++_MEMORY_SECTION_GUIDANCE_SLIM = (
++                "If you include assistant text before a tool call, use it to update your persistent memory sections. Section meanings: `World model:` = durable RULES of the environment that will still be true many actions from now (mechanics, what objects/colors mean, movement rules, win conditions) \u2014 never current positions, events, or what just happened. `Plan:` = intended next steps. Example \u2014 GOOD: `World model: Red cells are walls; each move shifts the player 2 cells; yellow keys open doors of the same color.` BAD: `World model: Batch stopped after 2 DOWNs, player now at (4,2).` (that is a passing event, not a rule). IMPORTANT: each labeled section you write REPLACES the stored version shown under 'Working world model carried from earlier turns' \u2014 write the COMPLETE updated section; any fact you omit is permanently lost."
++)
++
++
++def _wm_revise_nudges_enabled() -> bool:
++    """The sticky 'LEVEL CHANGED / ATTEMPT RESET - revise your sections' hint.
++
++    Built for an observed failure (the champion drifting without revising),
++    but a later model maintained its sections diligently with no prompting at
++    all, and the mechanism has needed two corrections since. Turning it off
++    changes ONLY the pressure: sections are still parsed, stored and
++    re-injected, so a null result means the nagging was not earning its
++    prompt weight."""
++    return not _memory_sections_disabled() and _get_env_bool(
++        "ARC3_WM_REVISE_NUDGES", False
++    )
++
++
++def _wm_rebuild_nudge_enabled() -> bool:
++    """The post-wipe "Rebuild them NOW: write fresh World model:, Goal model:,
++    Action model:" demand, which repeats every turn until the model complies.
++
++    An unmodified run wipes the sections silently - the carried block simply
++    vanishes and reappears when the model next writes something. This nudge
++    applies its strongest pressure exactly when the model has least to say: it
++    has just lost its notes and has not yet explored the new level. Default off
++    for that reason; the wipe itself is unaffected."""
++    return not _memory_sections_disabled() and _get_env_bool(
++        "ARC3_WM_REBUILD_NUDGE", False
++    )
++
++
++def _memory_sections_disabled() -> bool:
++    """ARC3_MEMORY_SECTIONS=off removes the persistent-memory mechanic entirely:
++    no carried block, no section guidance, no nudges, no parsing, and the
++    world-model lines drop out of the system prompt too. The model is left to
++    reason from history alone, which is what an unmodified run does before any
++    of this machinery existed."""
++    return os.environ.get("ARC3_MEMORY_SECTIONS", "").strip().lower() == "off"
++
++
++def _memory_section_labels() -> tuple[str, ...] | None:
++    """Which memory sections are advertised and carried, or None for all.
++
++    'slim' keeps World model and Plan - the two the model actually maintains.
++    Measured over 25 games: World model 351 writes, Plan 255, Open questions
++    25, Recent findings 11, Action model 10, Goal model 9, Cross-level notes
++    ZERO. The dropped sections are also the stale ones: a section written once
++    and never revised keeps being re-injected as current, which was observed
++    holding an answered question open for a whole game.
++
++    'medium' additionally keeps Action model. It is written in a third of
++    games and describes MECHANICS rather than transient state, so it ages far
++    better than `Recent findings:` or `Open questions:` - on a game whose
++    difficulty is working out what each control does, it is the section least
++    worth dropping."""
++    mode = os.environ.get("ARC3_MEMORY_SECTIONS", "").strip().lower()
++    if mode == "slim":
++        return _SLIM_MEMORY_SECTIONS
++    if mode == "medium":
++        return _MEDIUM_MEMORY_SECTIONS
++    return None
++
++
++def _message_display_text(message: dict[str, Any]) -> str:
++    """Transcript rendering of a built user message. Content-parts messages
++    carry their text in parts; images are noted rather than dumped."""
++    content = message.get("content")
++    if isinstance(content, str):
++        return content
++    if not isinstance(content, list):
++        return ""
++    pieces: list[str] = []
++    for part in content:
++        if not isinstance(part, dict):
++            continue
++        if part.get("type") == "image_url":
++            pieces.append("[image attached]")
++        else:
++            text = str(part.get("text") or "").strip()
++            if text:
++                pieces.append(text)
++    return "\n\n".join(pieces)
++
++
++def _wm_revise_hint(reason: str, already_shown: bool) -> str:
++    """Text for the sticky revise-nudge. Full event text on first showing;
++    accurate reminder wording on repeats (the event is no longer 'just now',
++    and the adjacent step summary may correctly say the level is unchanged)."""
++    if reason == "level":
++        if not already_shown:
++            return (
++                "LEVEL CHANGED - your memory sections were KEPT, not wiped. Learned "
++                "mechanics, action semantics, and the general goal usually carry over "
++                "to the new level; the map/layout is new, and levels often introduce "
++                "new elements or mechanics. On this first turn, scan the grid for "
++                "unfamiliar elements (compare objects against your World/Action "
++                "model), then revise your `World model:` and `Plan:` sections - "
++                "update the map, keep what still holds, and note anything new."
++            )
++        return (
++            "Reminder: a level change occurred earlier and you have STILL not "
++            "revised your `World model:` or `Plan:` sections since. Do it now - "
++            "update the map for this level, keep what still holds, and note "
++            "anything new."
++        )
++    if reason == "death":
++        if not already_shown:
++            return (
++                "ATTEMPT RESET - your memory sections were KEPT, not wiped. The "
++                "level is unchanged, so your map and mechanics knowledge still "
++                "hold. Amend your sections NOW with what this death taught you "
++                "(the fatal action or sequence and its cause), and revise your "
++                "`Plan:` to avoid repeating it."
++            )
++        return (
++            "Reminder: this attempt was reset by an earlier death and you have "
++            "STILL not amended your memory sections with what it taught you. Do "
++            "it now - record the fatal action or sequence and its cause, and "
++            "revise your `Plan:` to avoid repeating it."
++        )
++    return ""
++
++
++def _suppress_board_dumps(text: str) -> tuple[str, int]:
++    """Collapse runs of full-width board rows in tool output. Enforces the
++    existing 'never print full boards' policy mechanically for models that
++    ignore it: keeps the first rows of each run as orientation, replaces the
++    rest with a stub, and appends a compute-don't-count nudge. Small crops
++    (fewer than 6 rows) pass through untouched. ARC3_BOARD_DUMP_GUARD=0
++    disables."""
++    if not _get_env_bool("ARC3_BOARD_DUMP_GUARD", False):
++        return text, 0
++
++    def _board_like(line: str) -> bool:
++        stripped = line.strip()
++        return (
++            len(stripped) >= 24
++            and stripped.isalnum()
++            and len(set(stripped)) <= 10
++        )
++
++    lines = text.split("\n")
++    out: list[str] = []
++    suppressed = 0
++    i = 0
++    while i < len(lines):
++        if _board_like(lines[i]):
++            j = i
++            while j < len(lines) and _board_like(lines[j]):
++                j += 1
++            run = j - i
++            if run >= 6:
++                out.extend(lines[i:i + 2])
++                out.append(f"[... {run - 2} full-width board rows suppressed ...]")
++                suppressed += run - 2
++            else:
++                out.extend(lines[i:j])
++            i = j
++        else:
++            out.append(lines[i])
++            i += 1
++    if suppressed:
++        out.append(
++            "[BOARD PRINT GUARD] Printing full boards is disallowed and "
++            "character counting is unreliable for you. Compute over the grid "
++            "in python (segmentation nodes, slicing, run-length checks, BFS) "
++            "and print only coordinates, counts, and small crops."
++        )
++    return "\n".join(out), suppressed
++
++
++def _memory_section_max_chars() -> int:
++    """Cap on a single stored memory section, in characters.
++
++    These sections are re-injected into EVERY later turn opener, so an
++    oversized one is paid for repeatedly and grows the prompt without bound.
++    The extraction path used to store them uncapped, which let a degenerate
++    75k-character `World model:` into every subsequent prompt until the
++    request exceeded the model's context entirely. Legitimate sections run a
++    few hundred characters, so the default leaves ample room while making the
++    runaway case impossible. 0 disables the cap (the old behaviour)."""
++    return max(0, _get_env_int("ARC3_MEMORY_SECTION_MAX_CHARS", 8000))
++
++
++def _degeneracy_ratio_threshold() -> float:
++    """Compression ratio below which text is treated as degenerate.
++
++    Measured on representative text: varied prose 0.20-0.28, a coordinate
++    list 0.28, an ASCII board map 0.016, one sentence repeated 300 times
++    0.008, the field mojibake spiral 0.0016. The default sits below the board
++    map so a pasted grid is not falsely rejected, while still catching genuine
++    repetition loops by a wide margin. Rejecting on compressibility catches
++    those generally rather than one encoding artifact, and does not penalise
++    legitimate unicode. 0 disables the check."""
++    try:
++        return max(0.0, float(os.environ.get("ARC3_DEGENERACY_RATIO", "0.01")))
++    except ValueError:
++        return 0.01
++
++
++def _degeneracy_min_chars() -> int:
++    """Length floor for the degeneracy check: short strings compress badly for
++    uninteresting reasons, so testing them would produce false positives."""
++    return max(1, _get_env_int("ARC3_DEGENERACY_MIN_CHARS", 500))
++
++
++def _is_degenerate_text(value: str) -> bool:
++    threshold = _degeneracy_ratio_threshold()
++    if threshold <= 0:
++        return False
++    text = str(value or "")
++    if len(text) < _degeneracy_min_chars():
++        return False
++    try:
++        import zlib
++
++        encoded = text.encode("utf-8", "replace")
++        return len(zlib.compress(encoded, 6)) / max(1, len(encoded)) < threshold
++    except Exception:
++        return False
++
++
+ def _normalize_summary_text(value: Any, *, max_chars: int | None = 280) -> str:
+     text = " ".join(str(value or "").split())
+     if max_chars is None or max_chars <= 0 or len(text) <= max_chars:
+@@ -223,9 +1686,100 @@ def _normalize_summary_text(value: Any, *, max_chars: int | None = 280) -> str:
+     return f"{text[:max_chars].rstrip()}... [{omitted} chars omitted]"
+ 
+ 
++_HEADER_PARENTHETICAL_RE = re.compile(r"\([^)]*\)")
++# Only SHORT decorations are stripped. A long parenthetical or emphasised aside
++# means the line is a sentence rather than a header, and removing it could turn
++# prose into a spurious match - so the header is left intact and simply fails to
++# match, which loses the section rather than mis-capturing it.
++_HEADER_DECORATION_MAX_CHARS = 30
++
++
++def _normalize_section_header(head: str) -> str:
++    """Reduce a candidate section header to its bare label.
++
++    Models decorate these constantly. Observed in a single game: `Revised
++    world model`, `World model update`, `World model updates`, `World model
++    revision`, `Updated world model`, `World model (revised)`, `World model
++    (L4)`, `Action model (from run 1)`, `Plan (19 moves)`, and `Revised world
++    model - **important finding**`. Under exact matching, thirteen of
++    twenty-seven memory writes in that game were silently discarded, including
++    the one that correctly derived the level's kill rule.
++    """
++    def drop_short(match: "re.Match[str]") -> str:
++        return " " if len(match.group(0)) <= _HEADER_DECORATION_MAX_CHARS else match.group(0)
++
++    text = _HEADER_PARENTHETICAL_RE.sub(drop_short, head)
++    # an emphasised trailing aside is dropped on the same terms; the em-dash is
++    # deliberately NOT a cut point - it would discard text AFTER the label, which
++    # can change what the header means, and it earned nothing in practice
++    if "**" in text:
++        head_part, _, rest = text.partition("**")
++        if len(rest) <= _HEADER_DECORATION_MAX_CHARS:
++            text = head_part
++    text = text.replace("*", " ").replace("_", " ").replace("#", " ")
++    # dangling dashes left behind by a removed decoration are punctuation, not
++    # content: stripping them discards nothing, unlike cutting AT a dash
++    return " ".join(text.split()).strip(" \u2014\u2013-")
++
++
++def _tolerant_section_headers_enabled() -> bool:
++    """Accept decorated section headers (`Updated world model:`, `Plan (19
++    moves):`) rather than only the exact label.
++
++    Doubled memory capture on a measured game (12 sections -> 24), which also
++    doubles the carried world-model block the model is asked to rewrite in
++    full each turn - so it is a candidate for longer generations, not only for
++    better memory. Off restores exact matching."""
++    return _get_env_bool("ARC3_TOLERANT_SECTION_HEADERS", False)
++
++
++def _match_section_label(head: str, labels: list[str]) -> str | None:
++    """The canonical label a header refers to, or None.
++
++    Accepts the bare label, or the label with at most ONE extra word before or
++    after it. One word rather than more is deliberate: it covers every
++    decoration seen in practice while keeping prose from matching. Labels are
++    tried longest-first so `Cross-level notes` is not shadowed by `Plan`."""
++    tolerant = _tolerant_section_headers_enabled()
++    # with the knob off, compare the RAW head: normalising would still strip
++    # parentheticals and emphasis, which is itself part of the tolerance
++    normalized = (
++        _normalize_section_header(head).lower() if tolerant else " ".join(head.split()).lower()
++    )
++    if not normalized:
++        return None
++    if tolerant:
++        # A trailing parenthetical is decoration, not part of the label. The
++        # model versions and annotates its own sections - "World model
++        # (revised)", "(major revision)", "World model v34 (level 3)" - and
++        # those are the same section wearing a hat. Measured on one run: the
++        # one-extra-word rule alone caught 89% of section writes, stripping a
++        # trailing parenthetical first took it to 98%.
++        #
++        # Stripping rather than widening the word allowance to two: a
++        # parenthetical is a bounded construct, whereas two free words start
++        # matching prose. The 60-character cap in _extract_labeled_blocks is
++        # applied to the UNDECORATED head, so a long decoration is rejected
++        # before it can be stripped down to a match.
++        without_paren = re.sub(r"\s*\([^)]*\)\s*$", "", normalized).strip()
++        if without_paren:
++            normalized = without_paren
++    for label in sorted(labels, key=len, reverse=True):
++        lowered = label.lower()
++        if normalized == lowered:
++            return label
++        if not tolerant:
++            continue
++        prefix = lowered + " "
++        if normalized.startswith(prefix) and len(normalized[len(prefix):].split()) == 1:
++            return label
++        suffix = " " + lowered
++        if normalized.endswith(suffix) and len(normalized[: -len(suffix)].split()) == 1:
++            return label
++    return None
++
++
+ def _extract_labeled_blocks(content: str, labels: list[str]) -> dict[str, str]:
+-    normalized_labels = {label.lower(): label for label in labels}
+-    targets = tuple(f"{label.lower()}:" for label in labels)
+     extracted: dict[str, list[str]] = {label: [] for label in labels}
+     current_label: str | None = None
+ 
+@@ -234,15 +1788,17 @@ def _extract_labeled_blocks(content: str, labels: list[str]) -> dict[str, str]:
+         candidate = stripped
+         while candidate.startswith(("-", "*")):
+             candidate = candidate[1:].lstrip()
+-        lowered = candidate.lower()
+ 
+         matched_label: str | None = None
+         inline_value = ""
+-        for target in targets:
+-            if lowered.startswith(target):
+-                matched_label = normalized_labels[target[:-1]]
+-                inline_value = candidate[len(target):].strip()
+-                break
++        if ":" in candidate:
++            head, _, rest = candidate.partition(":")
++            # a header is a short line-initial phrase, not a sentence that
++            # happens to contain a colon
++            if len(head) <= 60:
++                matched_label = _match_section_label(head, labels)
++                if matched_label is not None:
++                    inline_value = rest.strip()
+ 
+         if matched_label is not None:
+             current_label = matched_label
+@@ -254,13 +1810,641 @@ def _extract_labeled_blocks(content: str, labels: list[str]) -> dict[str, str]:
+             extracted[current_label].append(stripped)
+ 
+     return {
+-        label: _normalize_summary_text("\n".join(lines).strip(), max_chars=None)
++        label: _normalize_summary_text(
++            "\n".join(lines).strip(), max_chars=_memory_section_max_chars() or None
++        )
+         for label, lines in extracted.items()
+         if "\n".join(lines).strip()
+     }
+ 
+ 
+-def _extract_scientist_note(content: str) -> dict[str, str]:
++def _opener_commit_hint() -> bool:
++    """Ask the turn opener for a commitment, the way a resumption already does.
++
++    Every piece of commitment pressure in the harness lives in the resumption
++    path - "call action(actions) with your best next action or short batch",
++    "Stop deliberating", "Act NOW". The fresh opener says nothing about acting
++    at all. Measured across two runs, sequences following a resumption batch
++    6.73 and 6.91 actions; those following a fresh opener batch 5.43 and 3.91,
++    and the opener figure is what collapsed when resumptions became rarer.
++
++    Deliberately asymmetric: probing stays available but has to be justified,
++    while batching is the default. An earlier prompt that told the model to
++    "re-issue actions one at a time" produced a 200-iteration single-step loop,
++    so the wording avoids prescribing a size while naming the batch.
++    """
++    return _get_env_bool("ARC3_OPENER_COMMIT_HINT", False)
++
++
++def _new_noop_wording() -> bool:
++    """Whether the patch-110 rewordings are used.
++
++    They replaced "changed nothing" with "no change inside the board area"
++    across every guard message. Off restores the wording of the run that scored
++    4.05, so the rewordings can be judged apart from the outcome line they
++    shipped with."""
++    return _get_env_bool("ARC3_NEW_CHANGED_PROMPTS", False)
++
++
++def _animation_timeline_enabled() -> bool:
++    """Whether the diff timeline is offered alongside the raw frames.
++
++    The timeline is a cheap first look, but a summary that reads coherently
++    invites stopping at it: on one level it produced a confident and wrong
++    mechanic that the model only corrected after going to the frames. Off, the
++    model computes its own comparison from `animation_frames` - a few lines it
++    writes readily - at the cost of a snippet before it learns anything, which
++    is wasted on animations that turn out to be irrelevant.
++
++    Only an experiment settles which costs more.
++    """
++    return _get_env_bool("ARC3_ANIMATION_TIMELINE", True)
++
++
++def _dedupe_multicall_line() -> bool:
++    """Drop the duplicated multi-call permission and its stale caveat.
++
++    Upstream states "you may call action() more than once" twice per opener,
++    about thirty lines apart, the second time without the caveat - so the last
++    word the model gets is the permission stripped of its qualifier.
++
++    The caveat itself is now enforced three ways: the batch loop breaks on a
++    terminal result and skips the rest, the per-snippet latch refuses the next
++    action() call, and an executed action ends the turn so the next snippet
++    always opens on a fresh board. On is the change; off keeps upstream.
++    """
++    return _get_env_bool("ARC3_DEDUPE_MULTICALL_LINE", False)
++
++
++def _prefer_tool_calls() -> bool:
++    """State the cost asymmetry: tool calls are free, actions are not.
++
++    The prompt already says not to ration tool calls, but only ever compares
++    them with other tool calls - never with reasoning, which is the trade the
++    model actually makes when it writes twelve thousand characters of
++    hypothesis before its first snippet. Observed: a turn spent 18,012
++    characters reasoning, hit the output cap, and executed nothing.
++    """
++    return _get_env_bool("ARC3_PREFER_TOOL_CALLS", False)
++
++
++# Three bands, a million apart, so no calculated value can cross between them.
++# The maximum _game_priority is about 1,325.
++#
++#   ~2,000,000   never trimmed: the original prefix is whole and this game has
++#                never paid a prefill, so it is the cheapest of all to continue
++#   ~1,000,000   warm again: trimmed once, prefix rebuilt. Ordered within the
++#                band by the estimate at that trim, so a game that was doing
++#                well sits above one that was stalling
++#      0..1,325  awaiting prefill: the trim invalidated the prefix and the next
++#                request has to pay for it anyway, which is the one moment
++#                yielding the slot is free
++#
++# The old scheme sent a flat 999999 while the prefix held, so every game tied at
++# startup and the server broke ties by arrival. Subtracting the queue position
++# gives a deterministic order instead.
++# ---------------------------------------------------------------- TEMPORARY
++# Diagnostic for "the backend never shows more than 13 concurrent requests with
++# 14 games". Records where each game thread is and prints a census once a
++# second, so the missing one can be located rather than guessed at.
++# Remove once the cause is known.
++_GATE_STATS = {"enqueued": 0, "blocked": 0, "blocked_ms": 0, "handover_ms": 0}
++_DIAG_LOCK = threading.Lock()
++_DIAG_STATE: dict[str, str] = {}
++_DIAG_LAST = [0.0]
++
++
++def _diag(agent: Any, where: str) -> None:
++    if not _get_env_bool("ARC3_DIAG_CONCURRENCY", False):
++        return
++    name = getattr(agent, "_diag_name", "?")
++    now = time.monotonic()
++    with _DIAG_LOCK:
++        _DIAG_STATE[name] = where
++        if now - _DIAG_LAST[0] < 1.0:
++            return
++        _DIAG_LAST[0] = now
++        counts: dict[str, int] = {}
++        for value in _DIAG_STATE.values():
++            counts[value] = counts.get(value, 0) + 1
++        total = len(_DIAG_STATE)
++        inflight = counts.get("request", 0)
++        summary = "  ".join(
++            f"{k}={v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
++        )
++        log.warning(
++            "DIAG %d games, %d in flight | %s | gate: %d handovers, %d blocked, "
++            "%dms blocked, %dms total",
++            total, inflight, summary,
++            _GATE_STATS["enqueued"], _GATE_STATS["blocked"],
++            _GATE_STATS["blocked_ms"], _GATE_STATS["handover_ms"],
++        )
++        if inflight < total:
++            others = sorted(
++                f"{g}:{w}" for g, w in _DIAG_STATE.items() if w != "request"
++            )
++            log.warning("DIAG   elsewhere: %s", ", ".join(others))
++
++
++def _priority_refresh_enabled() -> bool:
++    return any(_get_env_bool(name, False) for name in (
++        "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
++    ))
++
++
++def _priority_action_count(summary: dict[str, Any]) -> int:
++    return int(summary.get("end_action_num") or 0)
++
++
++@lru_cache(maxsize=8)
++def _load_pace_reference(path: str) -> dict[str, Any]:
++    data = json.loads(Path(path).read_text())
++    values = [data["fallback_tokens"], *data["by_level"].values()]
++    if not all(isinstance(v, (int, float)) and 0 < v < float("inf") for v in values):
++        raise ValueError("Pace reference costs must be finite positive numbers")
++    return data
++
++
++def _pace_reference_tokens(level: int) -> float:
++    path = os.environ.get("ARC3_PRIORITY_PACE_REFERENCE", "").strip()
++    if not path:
++        path = str(Path(__file__).with_name("priority_pace_reference.json"))
++    reference = _load_pace_reference(path)
++    return float(reference["by_level"].get(str(level), reference["fallback_tokens"]))
++
++
++class _PriorityGate:
++    """Harness-side admission control, for when the server ignores `priority`.
++
++    The request field is a hint a backend may drop; this enforces the same
++    ordering locally by limiting how many games hold a slot at once and
++    choosing who gets a freed one.
++
++    A game keeps its slot while its prefix is intact, because interrupting it
++    there throws away a cache entry about to be reused. When the trimmer drops
++    a message the prefix is invalid anyway and the next request must be
++    prefilled from the divergence point - the one moment when yielding is free -
++    so that is where the handover happens.
++
++    Release and re-enqueue are one critical section. Releasing first would leave
++    a window in which a lower-priority waiter takes the slot the caller was
++    about to compete for.
++    """
++
++    def __init__(self, slots: int) -> None:
++        self._cond = threading.Condition()
++        self._free = max(1, int(slots))
++        self._waiting: list[tuple[int, int]] = []
++        self._seq = 0
++        self._admitted: set[int] = set()
++        self._snapshots: dict[int, PrioritySnapshot] = {}
++        self._clock_start: float | None = None
++        self._clock_deadline: float | None = None
++        self._tail_fade_announced = False
++
++    def configure_clock(self, started_at: float, deadline: float | None) -> None:
++        """One shared monotonic clock, configured before initial admission.
++
++        Earliest session start/deadline wins; appropriate for simultaneously
++        launched sessions. No clock is inferred from the last action payload.
++        """
++        if _get_env_bool("ARC3_PRIORITY_TAIL_FADE", False) and deadline is None:
++            raise ValueError("ARC3_PRIORITY_TAIL_FADE requires a finite runtime or soft deadline")
++        with self._cond:
++            self._clock_start = min(self._clock_start, started_at) if self._clock_start is not None else started_at
++            if deadline is not None:
++                self._clock_deadline = min(self._clock_deadline, deadline) if self._clock_deadline is not None else deadline
++
++    def _snapshot_priority(self, snapshot: PrioritySnapshot, now: float) -> int:
++        elapsed = max(0.0, now - self._clock_start) if self._clock_start is not None else 0.0
++        endgame = _endgame_start_minutes() > 0 and elapsed >= 60 * _endgame_start_minutes()
++        tail_fraction = None
++        if _get_env_bool("ARC3_PRIORITY_TAIL_FADE", False):
++            if self._clock_deadline is None or self._clock_start is None:
++                raise ValueError("ARC3_PRIORITY_TAIL_FADE requires a finite runtime or soft deadline")
++            fraction_setting = os.environ.get("ARC3_PRIORITY_TAIL_FADE_FRACTION", "").strip()
++            if fraction_setting:
++                try:
++                    fraction = float(fraction_setting)
++                except ValueError:
++                    raise ValueError("ARC3_PRIORITY_TAIL_FADE_FRACTION must be > 0 and <= 1") from None
++                if not 0.0 < fraction <= 1.0:
++                    raise ValueError("ARC3_PRIORITY_TAIL_FADE_FRACTION must be > 0 and <= 1")
++                # Use the full shared run duration, not the shrinking time left.
++                window = fraction * max(0.0, self._clock_deadline - self._clock_start)
++            else:
++                window = max(1.0, 60 * _get_env_float("ARC3_PRIORITY_TAIL_FADE_MINUTES", 90.0))
++            remaining = max(0.0, self._clock_deadline - now)
++            tail_fraction = remaining / window if window > 0.0 else 0.0
++            if remaining <= window:
++                # Snapshot scoring also happens outside _pump's lock. Announce
++                # once per shared gate, even when several games trim together.
++                with self._cond:
++                    if not self._tail_fade_announced:
++                        self._tail_fade_announced = True
++                        log.warning(
++                            "tail fade phase after %.1f minutes: %.1f minutes "
++                            "remaining; fading tail B to zero over the final "
++                            "%.1f minutes, retaining hazard C",
++                            elapsed / 60.0, remaining / 60.0, window / 60.0,
++                        )
++        return priority_value(
++            snapshot, endgame=endgame, tail_fraction=tail_fraction,
++            human_actions=_priority_human_actions(), action_scale=_priority_action_scale(),
++            token_scale=_priority_token_scale(), action_weight=_priority_action_weight(),
++            tail_base=_priority_tail_base(), tail_cap=_priority_tail_cap(),
++            **_priority_level_options(),
++        )
++
++    def acquire(self, priority: int) -> None:
++        with self._cond:
++            self._enqueue_and_wait(priority)
++
++    def release(self) -> None:
++        with self._cond:
++            self._free += 1
++            self._pump()
++
++    def handover(self, priority: int, snapshot: PrioritySnapshot | None = None) -> None:  # noqa: D401
++        """Give up the slot and immediately compete for it again.
++
++        The caller may win it straight back, which is the right outcome when
++        nothing else is waiting or everything else is further along.
++        """
++        _t0 = time.monotonic()
++        with self._cond:
++            self._free += 1
++            self._enqueue_and_wait(priority, snapshot)
++        _GATE_STATS["handover_ms"] += int(1000 * (time.monotonic() - _t0))
++
++    def _enqueue_and_wait(self, priority: int, snapshot: PrioritySnapshot | None = None) -> None:
++        # TEMPORARY: with slots == games nobody should ever block here
++        _GATE_STATS["enqueued"] += 1
++        self._seq += 1
++        token = self._seq
++        if snapshot is not None:
++            self._snapshots[token] = snapshot
++        # negated so the heap pops the HIGHEST priority; the sequence number
++        # breaks ties by arrival
++        heapq.heappush(self._waiting, (-int(priority), token))
++        self._pump()
++        if token not in self._admitted:
++            _GATE_STATS["blocked"] += 1
++            t0 = time.monotonic()
++            while token not in self._admitted:
++                self._cond.wait()
++            _GATE_STATS["blocked_ms"] += int(1000 * (time.monotonic() - t0))
++        self._admitted.discard(token)
++
++    def _pump(self) -> None:
++        if _priority_refresh_enabled() and self._free > 0:
++            now = time.monotonic()
++            self._waiting = [
++                (-self._snapshot_priority(self._snapshots[token], now), token)
++                if token in self._snapshots else (priority, token)
++                for priority, token in self._waiting
++            ]
++            heapq.heapify(self._waiting)
++        woke = False
++        while self._free > 0 and self._waiting:
++            _, token = heapq.heappop(self._waiting)
++            self._snapshots.pop(token, None)
++            self._admitted.add(token)
++            self._free -= 1
++            woke = True
++        if woke:
++            self._cond.notify_all()
++
++
++def _max_active_streams() -> int:
++    """Games allowed to hold a slot at once. 0 disables the gate entirely.
++
++    Below the game count this staggers the start - a slot only frees when a
++    game's context is first trimmed, which measurements put 30 to 50 turns in -
++    so early games run alone for a while and late ones begin much later. That is
++    the point: a prefix is reused for as long as it lasts, instead of fourteen
++    games each progressing at a fourteenth of the rate.
++    """
++    return max(0, _get_env_int("ARC3_MAX_ACTIVE_STREAMS", 0))
++
++
++_PRIORITY_GATE: _PriorityGate | None = None
++_PRIORITY_GATE_LOCK = threading.Lock()
++
++
++def _priority_gate() -> _PriorityGate | None:
++    """Process-wide, built on first use. Games run as threads in one process,
++    so a module-level gate needs no plumbing and nothing to pickle."""
++    global _PRIORITY_GATE
++    slots = _max_active_streams()
++    if slots <= 0:
++        return None
++    with _PRIORITY_GATE_LOCK:
++        if _PRIORITY_GATE is None:
++            _PRIORITY_GATE = _PriorityGate(slots)
++            log.warning("priority gate active: %d concurrent streams", slots)
++        return _PRIORITY_GATE
++
++
++_PRIORITY_BAND = 1_000_000
++_PRIORITY_UNTRIMMED_BASE = 2_000_000
++
++
++def _priority_level_options() -> dict[str, Any]:
++    # Keep boolean lookup settings backward compatible. The explicit
++    # "remaining" mode selects the 8/7/5/0 tail, already at its final scale.
++    lookup = os.environ.get("ARC3_PRIORITY_TAIL_LOOKUP", "").strip().lower()
++    return {
++        "normalize_score": _get_env_bool("ARC3_PRIORITY_SCORE_NORMALIZATION", False),
++        "tail_lookup": (
++            "remaining" if lookup == "remaining"
++            else _get_env_bool("ARC3_PRIORITY_TAIL_LOOKUP", False)
++        ),
++        "tail_efficiency": _get_env_float("ARC3_PRIORITY_TAIL_EFFICIENCY", 0.8),
++    }
++
++
++def _priority_action_scale() -> float:
++    return max(1.0, _get_env_float("ARC3_PRIORITY_ACTION_SCALE", 115.0))
++
++
++def _priority_token_scale() -> float:
++    return max(1.0, _get_env_float("ARC3_PRIORITY_TOKEN_SCALE", 62000.0))
++
++
++def _priority_action_weight() -> float:
++    """How much of `c` comes from the action curve rather than the token one.
++
++    A blend rather than max(actions, tokens): max sits below both curves, so it
++    demotes harder than either measure alone warrants. Replaying four runs
++    against their own level-up costs, max was the weakest of every combination
++    tried, while the weight itself barely mattered - 0.25 to 1.0 all landed
++    within a few percent of each other.
++    """
++    return min(1.0, max(0.0, _get_env_float("ARC3_PRIORITY_ACTION_WEIGHT", 0.25)))
++
++
++def _priority_tail_cap() -> float:
++    """Ceiling on `b`, the value of every level after the current one.
++
++    min(cap, level + 1) rather than a constant. Chaining the measured
++    completion rates makes `b` nearly flat, which is why a constant looked
++    right - but that chain prices expected future score, and what the scheduler
++    needs is the term that lets depth outrank freshness. Replayed, a flat tail
++    was the worst option tested at every constrained budget; the cap matters
++    more than the slope, and a lower cap is better because it leaves more of
++    the ordering to `a`.
++    """
++    return max(0.0, _get_env_float("ARC3_PRIORITY_TAIL_CAP", 4.0))
++
++
++def _priority_tail_base() -> float:
++    """Value of `b` at level 1, before the per-level rise.
++
++    b = min(cap, base + level - 1). Base 2 with cap 4 gives the fitted form,
++    2 3 4 4 4...; base 6 with cap 6 gives a flat tail, which is what this
++    replaced and is worth being able to get back for a comparison.
++    """
++    return max(0.0, _get_env_float("ARC3_PRIORITY_TAIL_BASE", 2.0))
++
++
++def _priority_human_actions() -> float:
++    """Denominator offset in the efficiency term.
++
++    The benchmark scores a level by min(1, (human/used)^2). The level is not
++    finished yet, so the term belongs at the expected completion point rather
++    than the current count - hence an offset instead of a bare division.
++    """
++    return max(1.0, _get_env_float("ARC3_PRIORITY_HUMAN_ACTIONS", 25.0))
++
++
++def _endgame_start_minutes() -> float:
++    """Wall-clock minutes from a game's start before it switches phase.
++
++    0 disables the endgame phase entirely.
++    """
++    return max(0.0, _get_env_float("ARC3_ENDGAME_START_MINUTES", 0.0))
++
++
++# Endgame priorities sit in the upper half of whichever warmth band the game is
++# in: the cache argument for the bands is orthogonal to the phase, so a game
++# about to pay a prefill still yields to one that has a warm prefix. The widest
++# value either phase can produce is under 2,000 even at level 15, so half a
++# band is ample.
++_PRIORITY_ENDGAME_OFFSET = 500_000
++
++
++def _game_priority(
++    level: int,
++    actions_on_level: int,
++    tokens_on_level: int = 0,
++    endgame: bool = False,
++    total_levels: int | None = None,
++) -> int:
++    """Expected remaining score for a game on `level` after this much spend.
++
++    Two phases. In the main one, (a + b) * c:
++
++      a  what finishing THIS level banks - the score becomes `level` levels
++         completed, discounted by the benchmark's efficiency term
++      b  every level after it, min(cap, base + level - 1)
++      c  whether this level still yields anything, as a blend of two measured
++         decay curves
++
++    In the endgame there is no time to reach a further level, so the tail and
++    the hazard stop meaning anything and what remains is simply what completing
++    this level would bank. The 0.25 floor lets efficiency separate games at the
++    same depth without letting a shallower one overtake a deeper one.
++
++    Replaying four runs against their own level-up costs, the endgame switch was
++    worth 8 to 12% of total score at constrained budgets and nothing at all once
++    the budget covered what the games actually spent - which is where real runs
++    sit, so this matters only if the competition budget is tighter.
++    """
++    level = max(1, int(level))
++    actions = max(0, int(actions_on_level))
++    tokens = max(0, int(tokens_on_level))
++    options = _priority_level_options()
++    if options["normalize_score"] or options["tail_lookup"]:
++        # Same scoring as the refreshed queue, retaining this legacy path's
++        # phase offset. With both flags off, execute the original path below.
++        value = priority_value(
++            PrioritySnapshot(level, actions, tokens, total_levels=total_levels),
++            endgame=endgame, human_actions=_priority_human_actions(),
++            action_scale=_priority_action_scale(), token_scale=_priority_token_scale(),
++            action_weight=_priority_action_weight(), tail_base=_priority_tail_base(),
++            tail_cap=_priority_tail_cap(), **options,
++        )
++        return value + (_PRIORITY_ENDGAME_OFFSET if endgame else 0)
++    human = _priority_human_actions()
++    efficiency = min(1.0, (human / (human + actions)) ** 2)
++
++    if endgame:
++        value = level * (0.25 + efficiency)
++        return _PRIORITY_ENDGAME_OFFSET + max(1, int(value * 100))
++
++    a = level * efficiency
++    b = min(_priority_tail_cap(), _priority_tail_base() + level - 1.0)
++    weight = _priority_action_weight()
++    by_actions = actions / _priority_action_scale()
++    by_tokens = tokens / _priority_token_scale()
++    c = (
++        weight * 0.5 ** (by_actions * by_actions)
++        + (1.0 - weight) * 0.5 ** (by_tokens * by_tokens)
++    )
++    return max(1, int((a + b) * c * 100))
++
++
++def _persistent_functions_scope() -> str:
++    """How long a kept helper lives: 'levelup' (default), 'turn', or 'game'.
++
++    'turn' clears at every analyzer invocation that is not a resumption, so a
++    turn that inspects, acts and yields loses its toolkit even though the
++    investigation continues. That is conservative but costly: the helpers the
++    keepability check lets through are pure transforms taking the board as an
++    argument, and those do not care that an action happened.
++
++    'levelup' keeps them until the level changes, which is where a helper can
++    genuinely go wrong - not by holding stale data, which the check already
++    prevents, but by encoding an assumption in its code, like a glyph parser
++    with row offsets from the previous layout.
++
++    'game' keeps helpers across turns and level transitions. The model is
++    reminded to recheck level-specific assumptions. New game sessions still
++    start with an empty pool; snippet variables remain ephemeral in every scope.
++    """
++    scope = os.environ.get("ARC3_PERSISTENT_FUNCTIONS_SCOPE", "").strip().lower()
++    return scope if scope in ("turn", "levelup", "game") else "levelup"
++
++
++def _repeat_state_guard_enabled() -> bool:
++    """Refuse an action this snippet has already run from this exact board.
++
++    Buggy loop code can spend a whole life bar getting nowhere: a cursor that
++    wraps turns RIGHT into a five-state cycle, and `while pos < j: LEFT` walks
++    away from its target forever. The terminal latch does stop these, but only
++    once the game ends - 20 to 30 actions later.
++
++    Keyed on (board, action) rather than on repetition counts, because the
++    loops mostly alternate: LEFT, RIGHT, LEFT, RIGHT defeats a same-action rule
++    but revisits its first state on the third action.
++
++    Per snippet, and no override slot. A repeat ACROSS snippets is the model
++    choosing, having seen the board and the results; a repeat inside one is
++    code executing a plan fixed before any of it ran, which is the only case
++    that can be a bug the model has not had a chance to notice. It is also not
++    reading the refusal - its code is running - so writing a new snippet is the
++    response, and that clears the map.
++    """
++    return _get_env_bool("ARC3_REPEAT_STATE_GUARD", False)
++
++
++def _guards_active(level: Any) -> bool:
++    """Whether the per-action guards apply at this level.
++
++    Level 1 pays the smallest share of the score - one part in N - and it is
++    where the model knows least, so it probes hardest: repeating an action to
++    see whether the repeat differs, retrying what killed it to learn what
++    killed it. The guards read that as waste. ARC3_GUARDS_FROM_LEVEL=2 lets
++    level 1 run unguarded.
++
++    Covers the stale block and both repeat guards. NOT the batch no-op stop,
++    which costs one action of a planned sequence rather than refusing a
++    deliberate probe, and not the terminal latch, which stops a snippet acting
++    against a board that no longer exists.
++    """
++    try:
++        floor = max(1, int(os.environ.get("ARC3_GUARDS_FROM_LEVEL", "1") or 1))
++    except ValueError:
++        floor = 1
++    try:
++        return int(level) >= floor
++    except (TypeError, ValueError):
++        return True  # unknown level: guard rather than not
++
++
++def _persistent_functions() -> bool:
++    """Retain eligible function sources across calls; off by default.
++
++    Scope is controlled by ARC3_PERSISTENT_FUNCTIONS_SCOPE. State and variables
++    are never serialized. Definitions are validated and recreated in each fresh
++    sandbox, against its current harness globals.
++    """
++    return _get_env_bool("ARC3_PERSISTENT_FUNCTIONS", False)
++
++
++def _animation_enabled() -> bool:
++    """Whether intermediate animation frames are captured and offered.
++
++    Off by default: this is new information for the model rather than a fix to
++    something broken, so it needs to be measurable on its own."""
++    return _get_env_bool("ARC3_ANIMATION", False)
++
++
++def _report_gameplay_changed() -> bool:
++    """Tell the model WHICH kind of change an action produced.
++
++    The harness computes two flags - `board_changed` over the whole frame and
++    `gameplay_changed` over the interior only - but the turn opener reports the
++    first and the system prompt names only the first. On a game with a
++    remaining-steps bar the whole frame differs after every action, so the
++    opener says a change occurred every time and hedges: "verify that it
++    affected gameplay objects rather than only HUD elements". Meanwhile the
++    per-action trace, built from the second flag, can say the same action
++    changed nothing - so the two lines of the same message contradict each
++    other, and on a single-action turn only the misleading one appears.
++
++    On (default) the opener reports the three states that actually occur and
++    the system prompt explains both flags. The wording stays geometric -
++    "cells inside the board area" rather than "gameplay objects" - because the
++    test is a border crop, not a semantic one."""
++    return _get_env_bool("ARC3_REPORT_GAMEPLAY_CHANGED", False)
++
++
++def _explain_gameplay_changed() -> bool:
++    """Whether the system prompt explains the two change flags.
++
++    Split from the per-turn line because the two halves have very different
++    reach and very different arguments. The sentence is paid once and states
++    something the model cannot work out for itself: `last_action_call_result`
++    exposes both flags and nothing says what distinguishes them, so a game with
++    a timer bar makes `board_changed` true after every action.
++
++    The opener line is paid on every executing turn - on one measured run,
++    thousands of times against thirteen batch-guard firings - and only
++    summarises a comparison the model can make with frame_diff. It is also the
++    half with evidence against it: the one run that carried it scored 2.30 on
++    competition where the run without it scored 4.05, though that run changed
++    guard wording at the same time.
++
++    Defaults to following ARC3_REPORT_GAMEPLAY_CHANGED so the pair behaves as
++    before unless it is set explicitly.
++    """
++    raw = os.environ.get("ARC3_EXPLAIN_GAMEPLAY_CHANGED", "").strip()
++    if not raw:
++        return _report_gameplay_changed()
++    return raw.lower() not in ("0", "false", "no", "off")
++
++
++def _alias_respects_stored() -> bool:
++    """Whether `Hypothesis:` may replace a world model that already exists.
++
++    The alias condition checks only THIS reply's extraction: a reply carrying a
++    hypothesis and no `World model:` has its hypothesis stored as the world
++    model, overwriting whatever was there. That is right on a first turn and
++    destructive later - `Hypothesis` connotes untested, so a speculation
++    silently replaces tested content. Measured on 25 games: 7 such overwrites
++    against 351 world-model writes with tolerant headers on, 16 against 311 in
++    an unpatched run.
++
++    On (default) the aliases apply only when the STORED value is also empty.
++    Off restores the original behaviour."""
++    return _get_env_bool("ARC3_ALIAS_RESPECTS_STORED", True)
++
++
++def _extract_scientist_note(
++    content: str, stored: dict[str, Any] | None = None
++) -> dict[str, str]:
+     if not content.strip():
+         return {}
+     extracted = _extract_labeled_blocks(
+@@ -287,12 +2471,19 @@ def _extract_scientist_note(content: str) -> dict[str, str]:
+         "current_plan": extracted.get("Plan", ""),
+         "cross_level_notes": extracted.get("Cross-level notes", ""),
+     }
+-    if not result["world_model"]:
+-        result["world_model"] = extracted.get("Hypothesis", "")
+-    if not result["recent_findings"]:
+-        result["recent_findings"] = extracted.get("History check", "")
+-    if not result["current_plan"]:
+-        result["current_plan"] = extracted.get("Next test", "")
++    respect_stored = _alias_respects_stored()
++    existing = stored or {}
++
++    def apply_alias(key: str, label: str) -> None:
++        if result[key]:
++            return
++        if respect_stored and str(existing.get(key) or "").strip():
++            return
++        result[key] = extracted.get(label, "")
++
++    apply_alias("world_model", "Hypothesis")
++    apply_alias("recent_findings", "History check")
++    apply_alias("current_plan", "Next test")
+     return result
+ 
+ 

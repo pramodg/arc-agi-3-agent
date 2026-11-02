@@ -1,0 +1,858 @@
+@@ -1200,18 +4847,236 @@ class ToolAgent:
+                 lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
+             else:
+                 lines.append("Executed actions: none.")
++            if _report_gameplay_changed() and normalized_count:
++                # Whether the sequence MOVED anything. The harness computes this
++                # for every action - it drives the batch stop - and until now
++                # said nothing about it: `_describe_last_outcome` produces the
++                # sentence but is called nowhere, so neither its wording nor the
++                # older one it replaced has ever reached a transcript. On a
++                # single-action turn no per-action trace is built either, so the
++                # model had no account of the outcome from any source.
++                border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
++                if previous_step_summary.get("gameplay_changed"):
++                    lines.append("That sequence changed cells inside the board area.")
++                elif previous_step_summary.get("board_changed"):
++                    lines.append(
++                        f"That sequence changed only cells within {border} of the edge "
++                        "(usually a timer or remaining-steps bar) - nothing inside the "
++                        "board area moved."
++                    )
++                else:
++                    lines.append("That sequence produced no change anywhere on the board.")
++            if _animation_enabled() and not previous_step_summary.get("game_over"):
++                animation_line = describe_animation(
++                    previous_step_summary.get("animation"),
++                    action_display=previous_step_summary.get("animation_action"),
++                    # the animated action's own flag, not the sequence's: an
++                    # inert SPACE at the end of a batch that moved other things
++                    # still hid everything it did
++                    gameplay_changed=self._last_action_gameplay_changed,
++                    timeline=_animation_timeline_enabled(),
++                )
++                if animation_line:
++                    lines.append(animation_line)
++                self._prepare_animation_image(previous_step_summary)
++            no_op_stops = previous_step_summary.get("no_op_stops") or []
++            for stop in no_op_stops[:3]:
++                skipped = stop.get("skipped") or []
++                skipped_text = (
++                    f" The remaining {len(skipped)} action(s) {skipped!r} were skipped."
++                    if skipped
++                    else ""
++                )
++                lines.append(
++                    f"Note: a batched sequence was stopped by the no-op guard: action "
++                    f"{stop.get('action')!r} (position {stop.get('index')} in that batch) "
++                    + (f"executed but produced no change inside the board area.{skipped_text} "
++                       if _new_noop_wording() else
++                       f"executed but changed nothing outside the border.{skipped_text} ")
++                    +
++                    "That action IS included in the executed list above, so it is the "
++                    f"LAST of them - only the first {max(0, int(stop.get('index') or 1) - 1)} "
++                    "executed action(s) moved anything. Do not count submitted or executed "
++                    "actions to update your position; re-locate from current_frame."
++                )
++                trace = stop.get("trace") or []
++                if trace:
++                    lines.append("Per-action trace: " + "; ".join(str(t) for t in trace) + ".")
++            if len(no_op_stops) > 3:
++                lines.append(
++                    f"({len(no_op_stops) - 3} further no-op guard stop(s) occurred this sequence.)"
++                )
++            guard_stops = previous_step_summary.get("guard_stops") or []
++            for stop in guard_stops[:3]:
++                skipped = stop.get("skipped") or []
++                skipped_text = (
++                    f" The remaining {len(skipped)} action(s) ({skipped!r}) were never executed."
++                    if skipped
++                    else ""
++                )
++                if stop.get("kind") == "stale_state":
++                    # the exception said this in the turn where it happened;
++                    # restated here because the plan being void is worth
++                    # carrying into the turn that has to replace it
++                    lines.append(
++                        f"Note: the sequence was stopped before {stop.get('action')!r} - an "
++                        + ("earlier action in that snippet produced no change inside the "
++                           "board area, so the positions and "
++                           if _new_noop_wording() else
++                           "earlier action in that snippet changed nothing, so the positions and ")
++                        +
++                        f"paths it had computed may have been wrong.{skipped_text} Re-ground on "
++                        "the current board before planning again."
++                    )
++                elif stop.get("kind") == "known_death":
++                    lines.append(
++                        f"Note: the sequence was stopped before {stop.get('action')!r} - that "
++                        "action ended a previous attempt from that exact board state, so it was "
++                        f"NOT executed and the attempt is intact.{skipped_text} Plan a different "
++                        "move, or repeat it deliberately if you now believe it is safe."
++                    )
++                else:
++                    lines.append(
++                        f"Note: the sequence was stopped before {stop.get('action')!r} - that "
++                        + ("action already produced no change inside the board area in that "
++                           "exact board state, so it was "
++                           if _new_noop_wording() else
++                           "action already changed nothing in that exact board state, so it was ")
++                        +
++                        f"NOT executed and no action was spent.{skipped_text}"
++                    )
++                trace = stop.get("trace") or []
++                if trace:
++                    lines.append("Per-action trace: " + "; ".join(str(t) for t in trace) + ".")
++            if len(guard_stops) > 3:
++                lines.append(
++                    f"({len(guard_stops) - 3} further guard stop(s) occurred this sequence.)"
++                )
+             if previous_step_summary.get("run_complete"):
+                 lines.append("You have completed the run!")
+             elif previous_step_summary.get("level_transition"):
+-                lines.append("You have progressed to a new level!")
++                lines.append(
++                    LEVEL_START_USER_PROMPT
++                    if _level_transfer_guidance_enabled()
++                    else "You have progressed to a new level!"
++                )
+             else:
+-                lines.append("You are still on the same level.")
++                lines.append(
++                    self._manual_reset_context_line(previous_step_summary)
++                    or "You are still on the same level."
++                )
+             if previous_step_summary.get("game_over"):
+-                lines.append("The game is over.")
++                lines.append(
++                    "GAME OVER occurred during the previous sequence. This means the "
++                    "attempt FAILED (it does NOT mean the run is finished). The game has "
++                    "already been automatically RESET: the current level restarted from "
++                    "its initial state and previously completed levels are kept. A game "
++                    "over is caused either by the specific action taken (e.g., moving "
++                    "onto a hazard cell) or by a step/time budget running out, which is "
++                    "usually indicated by a bar at the grid border that shrinks with each "
++                    "action. Before acting again, diagnose the cause by inspecting the "
++                    "board right before the death. `history[-1].action` is 'RESET', "
++                    "`history[-2].action` is the fatal action, `history[-2].frame` is the "
++                    "death frame (the board after the fatal action), and "
++                    "`history[-3].frame` is the board immediately before "
++                    "the fatal action — check what cell the fatal move targeted there, and "
++                    "inspect the budget bar in the death frame. BAR RULE: the bar "
++                    "shrinking with each action is NORMAL — a slightly shorter bar is "
++                    "NOT evidence of the cause of death. The budget caused the death "
++                    "ONLY if the bar is fully (or almost fully) depleted in the death "
++                    "frame (`history[-2].frame`). If it IS depleted: you must reach the "
++                    "goal in fewer actions, or look for a way to restore the bar (e.g., "
++                    "collecting an item that refills it). If the bar clearly had budget "
++                    "remaining: the fatal action itself caused the death (hazard or "
++                    "forbidden move) — do NOT retry the same path; a DIFFERENT approach "
++                    "must be tried. Record the diagnosed cause in your world model."
++                )
++                if _animation_enabled():
++                    # after the BAR RULE, which tells the model how to read
++                    # history[-2] and history[-3]; this says what those two
++                    # frames cannot contain
++                    death_animation_line = describe_animation(
++                        previous_step_summary.get("animation"),
++                        action_display=previous_step_summary.get("animation_action"),
++                        # the animated action's own flag, not the sequence's: an
++                    # inert SPACE at the end of a batch that moved other things
++                    # still hid everything it did
++                    gameplay_changed=self._last_action_gameplay_changed,
++                        game_over=True,
++                        timeline=_animation_timeline_enabled(),
++                    )
++                    if death_animation_line:
++                        lines.append(death_animation_line)
++                fatal_action = str(previous_step_summary.get("fatal_action") or "")
++                if fatal_action:
++                    lines.append(
++                        f"The game over occurred immediately after action {fatal_action!r}. "
++                        "Apply the BAR RULE above to decide: bar fully depleted in the "
++                        "death frame means budget death (shorter route or bar restore "
++                        "needed); bar with budget remaining means this action itself was "
++                        "fatal and a DIFFERENT approach is required."
++                    )
++                game_over_trace = previous_step_summary.get("game_over_trace") or []
++                if game_over_trace:
++                    lines.append(
++                        "Per-action trace of the previous sequence: "
++                        + "; ".join(str(t) for t in game_over_trace)
++                        + "."
++                    )
++                self._prepare_gameover_images(
++                    history_entries, previous_step_summary
++                )
++                if _get_env_bool("ARC3_GAMEOVER_DIFF", False):
++                    # read at call time so this patch's hunks stay clear of the
++                    # env-knob block that other patches extend
++                    lines.extend(
++                        self._game_over_diff_lines(
++                            history_entries, previous_step_summary
++                        )
++                    )
++                lines.append(
++                    "Do NOT re-submit this same series of moves: the game is "
++                    "deterministic, so replaying the sequence that just killed you "
++                    "will kill you again. Change the plan BEFORE the fatal point - a "
++                    "different route, action, or timing. If you believe the same "
++                    "moves 'should' work, that belief is exactly what this death "
++                    "falsified; record the correction in your world model instead "
++                    "of retesting it."
++                )
+         elif (current_frame is not None and current_frame.step > 0) or action_num > 0:
+             lines.append("No previous action sequence was captured.")
+         else:
+             lines.append("No previous sequence has been executed yet.")
++        if self._pending_wm_rebuild_reason and _wm_rebuild_nudge_enabled():
++            lines.append(
++                f"IMPORTANT: your memory sections were reset by {self._pending_wm_rebuild_reason} "
++                "(cross-level notes were kept). Rebuild them NOW: write fresh "
++                # naming a section a restricted mode drops would ask for a
++                # rebuild that is parsed and then thrown away
++                f"{_section_list_phrase(_advertised_section_labels())} sections for this "
++                "level in your next message, before or alongside your tool call."
++            )
++        elif (
++            _wm_revise_nudges_enabled()
++            and getattr(self, "_pending_wm_revise_reason", "") in ("level", "death")
++        ):
++            _revise_reason = getattr(self, "_pending_wm_revise_reason", "")
++            lines.append(
++                _wm_revise_hint(
++                    _revise_reason,
++                    getattr(self, "_wm_revise_hint_shown", False),
++                )
++            )
++            self._wm_revise_hint_shown = True
++        elif _WM_NUDGE_TURNS > 0 and self._turns_without_wm_update >= _WM_NUDGE_TURNS:
++            lines.append(
++                f"You have not updated any memory section for "
++                f"{self._turns_without_wm_update} analysis steps. Review what recent "
++                "action traces, stops, and observations taught you, and write updated "
++                "sections now - knowledge that is not written down is eventually lost "
++                "to context eviction."
++            )
++        lines.extend(self._prepare_auto_diff(current_frame, previous_step_summary))
+         state_line = f"Current state: step {current_step}, level {current_level}"
+         if observed_max_level > current_level:
+             state_line += f" out of observed max level {observed_max_level} so far"
+@@ -1220,21 +5085,65 @@ class ToolAgent:
+             [
+                 state_line,
+                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
+-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.",
++            ]
++        )
++        # recording is independent of display: the guard needs the ledger even
++        # when the advisory lines are switched off
++        self._death_ledger_observe(history_entries, previous_step_summary)
++        if _get_env_bool("ARC3_DEATH_LEDGER", False):
++            # read at call time so this patch's hunks stay clear of the
++            # env-knob block that other patches extend; placed directly after
++            # the valid-actions line so the fatal continuations sit adjacent
++            # to the action choice they constrain
++            lines.extend(
++                self._death_ledger_lines(
++                    current_frame, history_entries, previous_step_summary
++                )
++            )
++        lines.extend(
++            [
++                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_call_result`, `frame_diff(before, after)`, and `action(actions)`.",
+                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
+                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
+                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
+-                "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
+-                "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
+-                "Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.",
+             ]
+         )
+-        lines.append(
+-            "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
+-            "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
+-        )
+-        lines.extend(self._summarized_knowledge_lines())
+-        lines.append("end of world model. ")
++        # Upstream states four things about the world model here, and with
++        # ARC3_MEMORY_SECTIONS=off three of them are false or unanswerable: the
++        # block they refer to is suppressed, so "Below you are provided with the
++        # current world model" is followed by nothing, and the model is told in
++        # capitals to always give a revised version with nowhere to put it.
++        # Observed as a drop in replies carrying any assistant text at all,
++        # 76% to 43% - a broken instruction, not an absent one, which is why
++        # `off` was never a clean control.
++        #
++        # The first sentence loses only its middle clause: "from the newest
++        # history" attaches to inspecting the evidence just as well, so the
++        # remainder still says use Python, inspect, and score against the goal.
++        if _memory_sections_disabled():
++            lines.append(
++                "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
++            )
++        else:
++            lines.extend(
++                [
++                    "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
++                    "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
++                    "Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.",
++                ]
++            )
++        if not _dedupe_multicall_line():
++            # kept mid-opener only for the upstream wording; the surviving copy
++            # in the closing block is where a note about calling action() twice
++            # belongs, next to the instruction to call it at all
++            lines.append(
++                "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
++                "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
++            )
++        knowledge_lines = self._summarized_knowledge_lines()
++        if knowledge_lines:
++            lines.extend(knowledge_lines)
++            lines.append("end of world model. ")
+         if action_num == 0:
+             lines.append(
+                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
+@@ -1247,12 +5156,21 @@ class ToolAgent:
+             [
+                 "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
+                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
+-                "If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.",
++                *self._memory_section_guidance(bool(knowledge_lines)),
+                 TOOL_CALL_FORMAT_GUIDANCE,
+             ]
+         )
+         if "MOUSE" in _normalize_valid_actions(valid_actions):
+             lines.append("If you use MOUSE, include integer row and col arguments.")
++        if _opener_commit_hint():
++            # last line of the opener, where the resumption prompt sits relative
++            # to the reply it influences
++            lines.append(
++                "When your evidence supports a choice, call `action(actions)` with the "
++                "sequence it supports. Probe with a single action when you genuinely "
++                "need to distinguish two possibilities; otherwise batch the route you "
++                "have."
++            )
+         return "\n".join(lines)
+ 
+     def _tools(self, state_path: Path) -> list[dict[str, Any]]:
+@@ -1279,35 +5197,105 @@ class ToolAgent:
+             }
+         ]
+ 
++    def _harness_template_kwargs(self) -> dict[str, Any]:
++        """Chat-template kwargs the HARNESS sets per request.
++
++        Shared by the request builder and the request log so the log records
++        what was actually sent rather than a reconstruction - which matters
++        for the effort ladder, where the value changes mid-run, and for
++        preserve_thinking, where the question is whether it reaches the server
++        at all."""
++        kwargs: dict[str, Any] = {}
++        preserve_thinking = _preserve_thinking_kwarg()
++        if preserve_thinking is not None:
++            kwargs["preserve_thinking"] = preserve_thinking
++        ladder = _reasoning_effort_ladder()
++        rung = getattr(self, "_reasoning_effort_rung", -1)
++        if ladder and 0 <= rung < len(ladder):
++            kwargs["reasoning_effort"] = ladder[rung]
++        return kwargs
++
+     def _chat_completion(
+         self,
+         messages: list[dict[str, Any]],
+         *,
+         tools: list[dict[str, Any]] | None,
+         request_timeout_seconds: float | None = None,
++        max_tokens: int | None = None,
++        enable_thinking: bool | None = None,
+     ) -> _ChatCompletionResult:
+         payload = build_chat_payload(
+             provider=self._model.provider,
+             model=self._model.model_id,
+             messages=messages,
+-            max_tokens=self._max_output_tokens,
++            max_tokens=self._max_output_tokens if max_tokens is None else max_tokens,
+             temperature=_LOCAL_ANALYZER_TEMPERATURE,
+             top_p=_LOCAL_ANALYZER_TOP_P,
+             top_k=_LOCAL_ANALYZER_TOP_K,
+-            thinking=bool(_LOCAL_ANALYZER_ENABLE_THINKING),
++            thinking=(
++                bool(_LOCAL_ANALYZER_ENABLE_THINKING)
++                if enable_thinking is None
++                else enable_thinking
++            ),
+             tools=tools,
+             tool_choice=_request_tool_choice(tools),
+             seed=_LOCAL_ANALYZER_SEED,
+         )
++        provider_prefs = _openrouter_provider_prefs(self._model.provider)
++        if provider_prefs:
++            payload["provider"] = provider_prefs
++        # merge rather than assign: the payload builder may already have set
++        # chat_template_kwargs (enable_thinking), and replacing the dict would
++        # drop it - as a request-level dict can also drop a server-side default
++        template_kwargs = dict(payload.get("chat_template_kwargs") or {})
++        template_kwargs.update(self._harness_template_kwargs())
++        if enable_thinking is not None:
++            # after the merge: _harness_template_kwargs does not set
++            # enable_thinking today, but an override that a later edit could
++            # silently undo is the bug that keeps recurring here
++            template_kwargs["enable_thinking"] = bool(enable_thinking)
++        if template_kwargs:
++            payload["chat_template_kwargs"] = template_kwargs
++        payload["messages"] = _strip_control_keys(
++            _apply_summary_visibility(
++                payload.get("messages") or [],
++                evicted=getattr(self, "_has_evicted", False),
++            )
++        )
+         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
+             return requests.post(
+                 f"{self._model.base_url.rstrip('/')}/chat/completions",
+                 headers=self._headers(),
+                 json=request_payload,
+-                timeout=request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
++                # (connect, read): one scalar gives the connect phase the whole
++                # read budget, so an unreachable host stalls a single attempt
++                # for the rest of the game
++                timeout=(
++                    _CONNECT_TIMEOUT_SECONDS,
++                    request_timeout_seconds if request_timeout_seconds is not None else self._timeout,
++                ),
++                stream=bool(request_payload.get("stream")),
+             )
+ 
+-        response = post_chat(payload)
++        # Per agent, not per process: every game meets the cold server on its
++        # own first request, so one shared flag would grant the grace to
++        # whichever game happened to go first and let the rest fail fast.
++        initial_grace = 0.0
++        if not self._http_initial_grace_used:
++            initial_grace = _env_float("ARC3_HTTP_RETRY_INITIAL_SECONDS", 0.0)
++        _diag(self, "request")
++        try:
++            response = _post_with_retries(
++                lambda: post_chat(payload),
++                retries=_env_int("ARC3_HTTP_RETRIES", 3),
++                base_seconds=_env_float("ARC3_HTTP_RETRY_BASE_SECONDS", 5.0),
++                max_seconds=_env_float("ARC3_HTTP_RETRY_MAX_SECONDS", 5.0),
++                initial_seconds=initial_grace,
++            )
++        finally:
++            # consumed whether the call succeeded or failed: the grace covers
++            # the server coming up, and by now it either did or will not
++            self._http_initial_grace_used = True
+         try:
+             response.raise_for_status()
+         except requests.HTTPError as exc:
+@@ -1322,22 +5310,63 @@ class ToolAgent:
+             if detail:
+                 message += f" | response: {detail}"
+             raise requests.RequestException(message)
+-        payload = response.json()
++        if payload.get("stream"):
++            # decode_unicode=True decodes each transport chunk INDEPENDENTLY, so a
++            # multi-byte UTF-8 sequence straddling a chunk boundary is split into
++            # two broken halves - an em-dash (E2 80 94) becomes "\u00e2" plus
++            # fragments. Most characters survive, which is why short probes look
++            # clean and only long streamed replies are corrupted. The assembler
++            # already decodes bytes itself, and a complete SSE line is always a
++            # whole UTF-8 sequence, so hand it raw bytes instead.
++            payload = assemble_streamed_chat_response(
++                response.iter_lines(decode_unicode=False)
++            )
++        else:
++            payload = response.json()
+         choices = payload.get("choices", [])
+         if not choices:
+-            raise requests.RequestException("server returned no choices")
++            detail = payload.get("error") or {
++                k: v for k, v in payload.items() if k not in ("choices",)
++            }
++            raise requests.RequestException(
++                f"server returned no choices | body: {str(detail)[:600]}"
++            )
+         choice = choices[0]
+         return _ChatCompletionResult(
+-            message=choice.get("message", {}),
++            message=_extract_leaked_tool_calls(choice.get("message", {})),
+             finish_reason=str(choice.get("finish_reason", "") or ""),
+             usage=payload.get("usage"),
++            served_by=str(payload.get("provider", "") or ""),
+         )
+ 
+     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
+-        if len(text) <= self._tool_output_chars:
++        """Keep both ends and drop the middle.
++
++        Truncating the tail loses the half that matters. An `error` field ends
++        with `SomeError: <the explanation>` after the traceback, so a deep
++        traceback pushed the explanation out entirely. And a snippet's `stdout`
++        typically prints the state, acts, then prints the state again - so the
++        tail holds the result and the head holds the setup.
++
++        Weighted toward the HEAD: a snippet's output is mostly sequential
++        reasoning that reads from the top, so two thirds there. The remaining
++        third is ample for what has to survive at the end - the longest refusal
++        message measures ~550 characters and a user-frame traceback ~250, well
++        inside a 1365-character tail at the default budget.
++        """
++        limit = self._tool_output_chars
++        if len(text) <= limit:
+             return text, False
+-        omitted = len(text) - self._tool_output_chars
+-        return f"{text[:self._tool_output_chars]}\n... [truncated {omitted} chars]", True
++        omitted = len(text) - limit
++        if not _get_env_bool("ARC3_MIDDLE_TRUNCATION", False):
++            return f"{text[:limit]}\n... [truncated {omitted} chars]", True
++        tail = limit // 3
++        head = limit - tail
++        return (
++            f"{text[:head]}\n... [truncated {omitted} chars from the middle] ...\n"
++            f"{text[-tail:]}",
++            True,
++        )
+ 
+     def _summarize_planned_actions(self, value: Any) -> Any:
+         if isinstance(value, dict):
+@@ -1366,6 +5395,9 @@ class ToolAgent:
+         for field in truncate_fields:
+             value = result.get(field)
+             if isinstance(value, str):
++                value, suppressed_rows = _suppress_board_dumps(value)
++                if suppressed_rows:
++                    result["board_print_suppressed_rows"] = suppressed_rows
+                 result[field], field_truncated = self._trim_tool_text(value)
+                 truncated = truncated or field_truncated
+         if truncated:
+@@ -1413,13 +5445,230 @@ class ToolAgent:
+             raise TypeError(f"Action {index} must be a string or a dict.")
+         return normalized
+ 
++    def _fatal_prefix_match(
++        self, state_hash: str, remaining_sigs: list[str]
++    ) -> tuple[int, str] | None:
++        """Does a recorded fatal sequence continue from here?
++
++        Returns ``(offset, action)`` when executing ``remaining_sigs`` from
++        this board would replay a recorded attempt into its death - offset 0
++        meaning the very next action is the fatal one. Returns None otherwise.
++
++        Generalizes the single-action check: an attempt recorded as actions
++        ``A[0..n-1]`` with pre-action hashes ``H[0..n-1]`` is fatal from here
++        if some ``H[k]`` equals this board AND ``A[k:]`` is a prefix of what
++        the model is about to run. The environment is deterministic and a
++        death resets to level start, so replaying ``A[k:]`` from ``H[k]``
++        reproduces ``H[k+1] ...`` and ends the attempt.
++
++        Catching it at the FIRST position of such a batch is what makes the
++        block worth having: the per-position check alone would let the harmless
++        prefix run and refuse only the final move, spending those actions to
++        arrive somewhere the model has already been. A model that genuinely
++        wants the prefix can submit it without the fatal tail, which no longer
++        matches and is not blocked.
++        """
++        index = getattr(self, "_death_ledger_index", None)
++        attempts = getattr(self, "_death_ledger_attempts", None)
++        if not index or not attempts or not remaining_sigs:
++            return None
++        for attempt_idx, position in index.get(state_hash, ()):  # type: ignore[union-attr]
++            try:
++                actions = attempts[attempt_idx]["actions"]
++            except (IndexError, KeyError, TypeError):
++                continue
++            tail = [action_signature(a) for a in actions[position:]]
++            if not tail or len(tail) > len(remaining_sigs):
++                continue
++            if remaining_sigs[: len(tail)] == tail:
++                return len(tail) - 1, tail[-1]
++        return None
++
++    def _action_guard_hook(
++        self,
++        grid: Any,
++        action_name: str,
++        action_data: dict[str, Any],
++        level: Any = None,
++        remaining: list[tuple[str, dict[str, Any]]] | None = None,
++    ) -> tuple[str, str] | None:
++        """Called by the solver before each action of a batch. Returns
++        ``(stop_reason, detail)`` to refuse, or None to proceed."""
++        guard = self._noop_repeat_guard
++        if guard is None or not grid:
++            return None
++        if not _guards_active(level):
++            # level 1 is where the model probes hardest and where an action is
++            # worth least, so the repeat guards can be told to start later. The
++            # guard still WATCHES - note_level and the state hash below run
++            # either way - so that by the time it starts refusing it already
++            # knows what has been tried.
++            guard.note_level(level)
++            self._noop_guard_pre_hash = _interior_state_hash(
++                [list(row) for row in grid]
++            )
++            return None
++        rows = [list(row) for row in grid]
++        state_hash = _interior_state_hash(rows)
++        guard.note_level(level)
++        # the solver passes ENGINE names (ACTION2); every other consumer - the
++        # death ledger, the transcript, the model itself - speaks model names
++        # (DOWN), so translate here or the guard both mismatches the ledger and
++        # reports "ACTION2" to a model that has never seen that label
++        action_sig = action_signature(
++            {"action": to_model_action(action_name), **(action_data or {})}
++        )
++        self._noop_guard_pre_hash = state_hash
++        if self._noop_guard_deaths_enabled and not self._guard_death_override_batch:
++            # with lookahead off, only THIS action is considered, so a match
++            # can be found solely at offset 0 - the per-position behaviour
++            window = (
++                (remaining or [(action_name, action_data)])
++                if _fatal_lookahead_enabled()
++                else [(action_name, action_data)]
++            )
++            remaining_sigs = [
++                action_signature({"action": to_model_action(name), **(data or {})})
++                for name, data in window
++            ]
++            match = self._fatal_prefix_match(state_hash, remaining_sigs)
++            if guard.should_block_death(
++                state_hash, action_sig, lambda _h, _a: match is not None
++            ):
++                offset, fatal_action = match  # type: ignore[misc]
++                if offset == 0:
++                    detail = (
++                        f"{fatal_action} ended a previous attempt on this level from this "
++                        "exact board state, so it was NOT executed."
++                    )
++                else:
++                    detail = (
++                        "this sequence replays a path that ended a previous attempt: "
++                        f"{fatal_action} is fatal {offset} action(s) from here, so NOTHING "
++                        "was executed and no actions were spent. Submit a different "
++                        "continuation, or the same prefix without the fatal tail."
++                    )
++                return (
++                    "known_death",
++                    detail
++                    + " This refusal is not catchable and ended the snippet, so anything "
++                    "after the call did not run. Issuing the same action again as the "
++                    "very next action will override the block and execute the action. "
++                    "That is only worth doing if you have a specific reason to believe "
++                    "it will not end the attempt this time. Otherwise, plan a different "
++                    "continuation from this state.",
++                )
++            # the override fired: let the rest of THIS call run without further
++            # death checks, or the model would have to insist again at every
++            # position of a sequence it has already deliberately confirmed
++            if match is not None:
++                self._guard_death_override_batch = True
++        if (
++            self._noop_guard_noops_enabled
++            and not (reset_exposed() and action_sig == "RESET")
++            and guard.should_block(state_hash, action_sig)
++        ):
++            return (
++                "known_noop",
++                (f"{action_sig} already produced no change inside the board area in this "
++                   "exact board state "
++                   if _new_noop_wording() else
++                   f"{action_sig} already changed nothing in this exact board state ")
++                +
++                "earlier on this level, so it was NOT executed and no action was "
++                "spent. This refusal is not catchable and ended the snippet, so "
++                "anything after the call did not run - a retry loop cannot probe "
++                "past it. It applies to that one action from this one board state; "
++                "it is not a constraint on sequences or batch size. Issuing the same "
++                "action again as the very next action will override the block and "
++                "execute the action. That is only worth doing if you have a specific "
++                "reason to believe it will behave differently now. Otherwise, plan a "
++                "different continuation from this state.",
++            )
++        if (
++            _repeat_state_guard_enabled()
++            and (state_hash, action_sig) in self._repeat_state_seen
++        ):
++            # after known_noop deliberately: a repeated no-op is better reported
++            # as a no-op, which also keeps its override intact. Reaching here
++            # means the action DID change the board and still returned to a
++            # state this snippet has already acted from.
++            return (
++                "repeated_action_in_state",
++                f"{action_sig} was already run from this exact board state earlier "
++                "in this snippet, so what it does here is known and it was NOT "
++                # not "no action budget was spent": by construction this fires
++                # after the snippet has already spent budget on the actions that
++                # got it here, and the model reads that phrase as covering the
++                # whole snippet
++                "executed. A sequence that returns to "
++                # examples, not a diagnosis: the harness knows the board
++                # repeated, not why, and stating the cause would have the model
++                # looking for a wrapping cursor it may not have
++                "a board it has already acted from is not advancing (e.g. a cursor "
++                "that wraps around, or a loop stepping the wrong way past its "
++                "target). "
++                "Nothing after the call ran. Re-read `current_frame`, work out why "
++                "the sequence is not converging, and write a different snippet - "
++                "this block is per snippet, so the next one starts with no history.",
++            )
++        guard.note_executed(state_hash, action_sig)
++        self._guard_hook_trace.append((state_hash, action_sig))
++        return None
++
++    def _record_guard_observations(
++        self,
++        guard: NoopRepeatGuard,
++        raw_payload: dict[str, Any],
++        compact_payload: dict[str, Any],
++    ) -> None:
++        """Record every executed position of this call, not just the first.
++
++        The guard hook fires once per position immediately before that action
++        runs, so `_guard_hook_trace` holds the board hash each action actually
++        executed against - including the intermediate states of a batch, which
++        appear nowhere in the returned payload. The solver reports outcomes as
++        `gameplay_changed_per_action`, index-aligned with `executed_actions`
++        and therefore with the trace; a single-action call has no such list, so
++        the aggregate verdict is used instead.
++
++        Zipping to the shorter of the two is deliberate: a batch stopped early
++        (blocked, fatal, invalid) leaves one more trace entry than there are
++        outcomes, and an unmatched entry must not be recorded against a verdict
++        that belongs to a different action.
++        """
++        trace = list(self._guard_hook_trace)
++        self._guard_hook_trace = []
++        if not trace:
++            return
++        verdicts = raw_payload.get("gameplay_changed_per_action")
++        if not isinstance(verdicts, list) or not verdicts:
++            if len(trace) != 1 or not compact_payload.get("executed"):
++                return
++            verdicts = [compact_payload.get("gameplay_changed")]
++        for (state_hash, action_sig), changed in zip(trace, verdicts):
++            if reset_exposed() and action_sig == "RESET":
++                # Retain its position in the trace so following verdicts stay
++                # aligned, but do not learn that a bar-only reset is ineffective.
++                continue
++            # unconditional: known_noop reaches a repeated no-op first, so
++            # filtering on `changed` here would buy nothing
++            self._repeat_state_seen.add((state_hash, action_sig))
++            guard.observe(state_hash, action_sig, gameplay_changed=changed)
++
+     def _compact_action_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+         compact = {
+             "executed": bool(payload.get("executed")),
+             "action_num": payload.get("action_num"),
+             "level": payload.get("level"),
+             "score": payload.get("score"),
+-            "reward": payload.get("reward"),
++            # `reward` is not carried: it is (levels_completed - previous) /
++            # number_of_levels, so it reads 0.0 on every action that does not
++            # finish a level. A model seeing 0.0 on almost every action can
++            # reasonably take it for a verdict on the action, which it is not,
++            # and `level_completed` in this same dict already says the thing it
++            # was trying to say. The solver still computes it for the viewer
++            # and the raw payload.
+             "state": payload.get("state"),
+             "valid_actions": payload.get("valid_actions", []),
+             "board_changed": bool(payload.get("board_changed")),
+@@ -1429,6 +5678,8 @@ class ToolAgent:
+             "run_complete": bool(payload.get("run_complete")),
+             "action_display": payload.get("action_display") or payload.get("action_name"),
+         }
++        if "gameplay_changed" in payload:
++            compact["gameplay_changed"] = bool(payload.get("gameplay_changed"))
+         executed_actions = payload.get("executed_actions")
+         if isinstance(executed_actions, list) and executed_actions:
+             compact["executed_actions"] = [str(action).strip() for action in executed_actions if str(action).strip()]
+@@ -1439,6 +5690,11 @@ class ToolAgent:
+             compact["requested_count"] = payload.get("requested_count", batch_size)
+             compact["executed_count"] = payload.get("executed_count", batch_size)
+             compact["stopped_early"] = bool(payload.get("stopped_early"))
++        # blocked_action names the refused action for the next turn's opener;
++        # without it the model was told "the sequence was stopped before None"
++        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation"):
++            if passthrough_key in payload:
++                compact[passthrough_key] = payload.get(passthrough_key)
+         if payload.get("stop_reason"):
+             compact["stop_reason"] = payload.get("stop_reason")
+         if payload.get("stop_detail"):
+@@ -1446,6 +5702,14 @@ class ToolAgent:
+         for timing_key in ("run_elapsed_seconds", "time_remaining_seconds"):
+             if timing_key in payload:
+                 compact[timing_key] = payload.get(timing_key)
++        # the session's own clock, which is also what decides when the game
++        # stops - so the endgame phase cannot drift away from the deadline it
++        # is meant to anticipate. It starts at session construction, so a game
++        # waiting on the gate is already ageing, which is the same convention
++        # max_runtime_s_per_game uses.
++        elapsed = payload.get("run_elapsed_seconds")
++        if isinstance(elapsed, (int, float)):
++            self._game_elapsed_seconds = float(elapsed)
+         if payload.get("error"):
+             compact["error"] = payload.get("error")
+         return compact
+@@ -1466,7 +5730,7 @@ class ToolAgent:
+         def _serialized_runtime_state(
+             *,
+             next_valid_actions: list[str] | None = None,
+-            last_action_result: dict[str, Any] | None = None,
++            last_action_call_result: dict[str, Any] | None = None,
+         ) -> dict[str, Any]:
+             refreshed_frame, refreshed_history = load_runtime_state(state_path)
+             current_frame_payload = _ascii_frame_view_payload(refreshed_frame)
+@@ -1475,15 +5739,20 @@ class ToolAgent:
+             else:
+                 sanitized_actions = list(valid_actions)
+             persisted_action_result = (
+-                last_action_result
+-                if isinstance(last_action_result, dict)
+-                else self._last_action_result
++                last_action_call_result
++                if isinstance(last_action_call_result, dict)
++                else self._last_action_call_result
+             )
+             return {
+                 "current_frame": current_frame_payload,
+                 "history": _ascii_history_view_payload(refreshed_history),
+                 "valid_actions": sanitized_actions,
+-                "last_action_result": (
++                "death_ledger": (
++                    self._death_ledger_payload()
++                    if _get_env_bool("ARC3_DEATH_LEDGER", False)
++                    else None
++                ),
++                "last_action_call_result": (
+                     dict(persisted_action_result)
+                     if isinstance(persisted_action_result, dict)
+                     else {}
+@@ -1491,9 +5760,24 @@ class ToolAgent:
+             }
+ 
+         terminal_action_result: dict[str, Any] | None = None
++        snippet_executed_actions = 0
+ 
+-        def _handle_action(actions: list[dict[str, Any]]) -> dict[str, Any]:
+-            nonlocal terminal_action_result
++        def _handle_animation(request: dict[str, Any]) -> dict[str, Any]:
++            if self._step_env_callback is None:
++                return {"error": "Animation frames are not available in this session."}
++            raw = self._step_env_callback({"query": "animation"})
++            record = raw.get("record") if isinstance(raw, dict) else None
++            record = record if isinstance(record, dict) else None
++            if str(request.get("kind") or "") == "frames":
++                return build_animation_frames(record)
++            if not _animation_timeline_enabled():
++                return {}
++            return build_animation_view(record)
++
++        def _handle_action(
++            actions: list[dict[str, Any]], *, stale_after: str | None = None
++        ) -> dict[str, Any]:
++            nonlocal terminal_action_result, snippet_executed_actions
+             if self._step_env_callback is None:
+                 raise RuntimeError("action(actions) is not available in this session.")
+             normalized_actions = self._normalize_python_actions(actions)

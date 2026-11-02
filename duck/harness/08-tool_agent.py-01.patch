@@ -1,0 +1,234 @@
+diff --git a/ARC3-Inference/inference/agent/tool_agent.py b/ARC3-Inference/inference/agent/tool_agent.py
+index 59655e9..84a9cdd 100644
+--- a/ARC3-Inference/inference/agent/tool_agent.py
++++ b/ARC3-Inference/inference/agent/tool_agent.py
+@@ -1,11 +1,16 @@
+ """Direct OpenAI-compatible tool-calling analyzer for ARC puzzle runs."""
+ from __future__ import annotations
+ 
++import base64
++import heapq
++import threading
+ import json
+ import logging
+ import os
++import random
+ import re
+ import time
++from functools import lru_cache
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+@@ -13,25 +18,61 @@ from urllib.parse import urlparse, urlunparse
+ 
+ import requests
+ 
+-from inference.agent.action_names import to_engine_action, to_model_action
++from inference.agent.noop_repeat_guard import NoopRepeatGuard, action_signature
++from inference.agent.priority_scheduler import (
++    ProgressPace, PrioritySnapshot, parse_total_levels, priority_value,
++)
++from inference.utils.animation import (
++    _transient_cells as _animation_transient_cells,
++    build_animation_frames,
++    build_animation_view,
++    describe_animation,
++)
++from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
++from inference.utils.retained_functions import function_signature
+ from inference.agent.prompts import (
++    apply_level_transfer_system_guidance,
++    LEVEL_START_USER_PROMPT,
+     COMPACT_TOOL_SESSION_ADDENDUM,
++    PERSISTENT_FUNCTIONS_LINE,
++    EPHEMERAL_FUNCTIONS_LINE,
++    SUMMARY_REQUEST_PROMPT,
++    PREFER_TOOL_CALLS_LINE,
+     GAME_OVERVIEW_ADDENDUM,
+-    PYTHON_ADDENDUM,
++    WORLD_MODEL_ADDENDUM,
++    WORLD_MODEL_FREE_ADDENDUM,
++    FRAME_DIFF_HINT_ADDENDUM,
++    STEP_VERIFICATION_ADDENDUM,
++    PYTHON_ADDENDUM_HEAD,
++    PYTHON_ADDENDUM_TAIL,
++    GAMEPLAY_CHANGED_ADDENDUM,
+     STRUCTURED_RUNTIME_STATE_ADDENDUM,
++    ANIMATION_ADDENDUM,
++    ANIMATION_ADDENDUM_TIMELINE,
+     MULTIMODAL_CONTEXT_ADDENDUM,
+     TOOL_CALL_FORMAT_GUIDANCE,
+     VISUAL_GAME_ADDENDUM,
++    ACTION_INFO_ADDENDUM,
++    UNDO_INFO_ADDENDUM,
++    RESET_INFO_ADDENDUM,
+ )
+ 
+ from inference.agent.vision_context import (
++    animation_composite_part,
++    animation_death_image_mode,
++    animation_image_mode,
++    animation_peak_part,
+     current_grid_image_enabled,
+     current_grid_image_part,
+ )
+ 
+ from inference.agent.python_tool_sandbox import run_sandboxed_python
+ from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
+-from inference.utils.openai_compat import build_chat_payload, build_headers
++from inference.utils.openai_compat import (
++    assemble_streamed_chat_response,
++    build_chat_payload,
++    build_headers,
++)
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -73,6 +114,14 @@ def _get_env_bool(name: str, default: bool) -> bool:
+     return default
+ 
+ 
++def _level_transfer_guidance_enabled() -> bool:
++    """Opt-in level-transfer prompts; set before constructing the agent.
++
++    ARC3_LEVEL_TRANSFER_GUIDANCE defaults off, preserving the original prompts.
++    """
++    return _get_env_bool("ARC3_LEVEL_TRANSFER_GUIDANCE", False)
++
++
+ def _contains_tool_call_markup(*chunks: str) -> bool:
+     for chunk in chunks:
+         lowered = chunk.lower()
+@@ -141,6 +190,13 @@ _LOCAL_ANALYZER_TOOL_STEPS = _get_env_int("LOCAL_ANALYZER_TOOL_STEPS", 12)
+ _LOCAL_ANALYZER_TOOL_TIMEOUT = _get_env_int("LOCAL_ANALYZER_TOOL_TIMEOUT", 30)
+ _LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS = _get_env_int("LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS", 1024)
+ _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0.0)
++# A wall-clock budget is really a token budget with the throughput baked in:
++# the same 45 seconds bought 2,140 generated tokens on one backend and 3,829 on
++# a faster one, so every serving change silently retuned it. Measured in
++# tokens the setting means the same thing whatever the hardware does. Zero
++# disables, as with the seconds; if both are set, whichever comes first ends
++# the turn.
++_LOCAL_ANALYZER_YIELD_TOKENS = _get_env_int("LOCAL_ANALYZER_YIELD_TOKENS", 0)
+ _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
+ _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
+ _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
+@@ -148,15 +204,102 @@ _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
+ _LOCAL_ANALYZER_SEED = _get_env_int("LOCAL_ANALYZER_SEED", -1)
+ _REQUEST_SAFETY_MARGIN_TOKENS = 512
+ _CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS = 512
+-_PERSISTENT_HISTORY_ASSISTANT_TURNS = 30
++def _context_drain_floor_mode() -> bool:
++    """Whether the drain stops ABOVE the target rather than below it.
++
++    History is dropped in whole blocks, so trimming "until under the target"
++    normally overshoots by most of a block. With a 40k budget and a 12k drain
++    the band is nominally 28k-40k, but simulation with ~6k blocks gives an
++    effective 14k-38k: the average sits ~3k below the nominal midpoint and the
++    minimum is far below the target.
++
++    Floor mode drops the mandatory blocks to get under budget, then stops
++    before a drop would cross below the target - so the retained content keeps
++    a real floor and the band means what it says. The cost is trim frequency:
++    the overshoot is what lengthens the interval between trims, so removing it
++    trims about half again as often, which shortens the stable prefix and cuts
++    the prefix-cache hit rate. Off by default for that reason; the same average
++    depth is available by raising the budget, which does not touch trim
++    frequency."""
++    return _get_env_bool("ARC3_CONTEXT_DRAIN_FLOOR", False)
++
++
++def _context_drain_tokens() -> int:
++    """Hysteresis for context trimming, in tokens.
++
++    Without it, trimming drops the oldest exchange the moment the estimate
++    exceeds the budget and stops the instant it fits - so once history reaches
++    the ceiling, nearly every turn evicts a little. Each eviction is cheap in
++    tokens but total in cache cost: prefix caching keys on the token sequence
++    from position zero, so removing anything from the FRONT shifts every
++    surviving token and invalidates the whole cached prefix, not just the part
++    removed. Frequent small evictions are therefore the worst case.
++
++    With a drain set, trimming still TRIGGERS at the budget but keeps dropping
++    until it is `drain` tokens below it, so evictions become rare and large:
++    the same tokens discarded overall, a fraction of the invalidations. The
++    cost is average history depth - the window sits below the budget most of
++    the time rather than pressed against it.
++
++    Size it against tokens per turn: at ~4-5k per turn including the opener,
++    8-12k buys two or three clean turns between evictions. 0 (default) keeps
++    the original drop-until-it-fits behavior."""
++    return max(0, _get_env_int("ARC3_CONTEXT_DRAIN_TOKENS", 0))
++
++
++def _history_turn_drain() -> int:
++    """Hysteresis for the assistant-turn cap, in assistant messages.
++
++    The token trimmer got hysteresis in ARC3_CONTEXT_DRAIN_TOKENS, but the
++    turn cap runs AFTER it and had none: once history sits at the cap, every
++    commit shaves back to exactly N, so the prefix is invalidated on every
++    single turn. With a 46k window and a cap of 30 assistant messages the cap
++    is the binding limit, which is why a token drain alone changed nothing.
++
++    Set this and the cap triggers at N but drains to N - drain, so evictions
++    become periodic instead of continuous."""
++    return max(0, _get_env_int("ARC3_HISTORY_TURN_DRAIN", 0))
++
++
++def _history_drain_coalesce() -> bool:
++    """Take the deep turn cut whenever the token trimmer already dropped.
++
++    Invalidation is all-or-nothing: removing anything from the front of
++    history shifts every surviving token, so a commit that has already
++    dropped blocks for token reasons has already paid the full cache cost.
++    Dropping turns in that same commit is therefore free, whereas letting the
++    cap fire on its own a turn later costs a second invalidation. This makes
++    the two mechanisms evict together rather than alternately."""
++    return _get_env_bool("ARC3_HISTORY_DRAIN_COALESCE", False)
++
++
++def _persistent_history_assistant_turns() -> int:
++    """Cap on assistant messages kept in persistent history.
++
++    Counts ASSISTANT MESSAGES, not analyzer turns: a turn that inspects, then
++    computes, then acts spends three of them, so 30 is closer to ten or
++    fifteen turns of real history than to thirty. The cap is independent of
++    the token budget, so with a large context window it can be the binding
++    constraint while thousands of tokens sit unused - which is what the
++    default 30 does at 98k, having been chosen when the window was 32k.
++
++    0 or negative disables the cap entirely, leaving the token budget as the
++    only limit."""
++    return _get_env_int("ARC3_HISTORY_ASSISTANT_TURNS", 30)
++_WM_NUDGE_TURNS = _get_env_int("ARC3_WM_NUDGE_TURNS", 0)
++_WM_WIPE_ON_GAME_OVER = _get_env_int("ARC3_WM_WIPE_ON_GAME_OVER", 1)
++_AUTO_FRAME_DIFF = _get_env_bool("ARC3_AUTO_FRAME_DIFF", False)
++_AUTO_FRAME_DIFF_BUDGET = _get_env_int("ARC3_AUTO_FRAME_DIFF_BUDGET", 300)
++_AUTO_FRAME_DIFF_MAX_GROUP = 40
++_DIFF_IMAGE = _get_env_bool("ARC3_DIFF_IMAGE", False)
+ _RESPONSE_META_MAX_CHARS = 4000
+ 
+ _PYTHON_TOOL_DESCRIPTION = (
+     "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
+     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
+-    "`valid_actions`, `last_action_result`, "
++    "`valid_actions`, `last_action_call_result`, "
+     "and `action(actions)` for executing one or more real environment actions. "
+-    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; "
++    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
+     "`history[-1].frame` is the current post-action frame, not the previous frame. "
+     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
+     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
+@@ -198,8 +341,10 @@ def _terminal_action_stop_detail(reason: str | None) -> str:
+         return "No further actions were executed because the run is already complete."
+     if reason == "game_over":
+         return (
+-            "No further actions were executed because the previous action reached GAME_OVER; "
+-            "the runner will auto-reset before the next analyzer turn."
++            "No further actions were executed because the previous action reached GAME_OVER "
++            "(attempt failed; the run is NOT finished). The runner will auto-reset the level "
++            "before your next turn. Cause is either the action itself (hazard) or a depleted "
++            "step/time budget (usually a shrinking bar at the grid border)."
+         )
+     if reason == "level_completed":
+         return (

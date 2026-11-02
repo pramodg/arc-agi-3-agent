@@ -1,0 +1,320 @@
+@@ -1871,8 +6859,35 @@ class ToolAgent:
+                             json.loads(raw_arguments)
+                         except json.JSONDecodeError as exc:
+                             malformed_argument_errors.append(f"{tool_name}: invalid JSON arguments ({exc})")
++                if malformed_argument_errors:
++                    # Drop ALL calls from this reply rather than the bad one.
++                    #
++                    # An unparseable arguments string means the reply was cut
++                    # off mid-call (finish_reason=length is the usual cause),
++                    # so anything after the truncation point is missing and an
++                    # earlier "valid" call in the same message expresses only
++                    # part of an intent - dispatching half a plan is worse than
++                    # dispatching none.
++                    #
++                    # Critically, the message must also never reach history:
++                    # servers re-parse tool calls in the incoming message list
++                    # when rendering the chat template, so one malformed call
++                    # committed to history makes EVERY later request fail at
++                    # render time, before inference - an unbreakable loop that
++                    # the HTTP retry cannot help with. Content and reasoning
++                    # are kept; only the calls are dropped, which routes this
++                    # into the existing no-tool-call path.
++                    log.warning(
++                        "dropping %d malformed tool call(s) (finish_reason=%s): %s",
++                        len(tool_calls),
++                        result.finish_reason or "?",
++                        "; ".join(malformed_argument_errors),
++                    )
++                    tool_calls = []
++                    truncated_tool_call = str(result.finish_reason or "").strip() == "length"
+                 response_meta = _format_model_response_meta(
+                     finish_reason=result.finish_reason,
++                    served_by=result.served_by,
+                     reasoning=reasoning,
+                     content=content,
+                     tool_calls=tool_calls,
+@@ -1889,7 +6904,8 @@ class ToolAgent:
+                 if reasoning:
+                     captured_reasoning = reasoning
+                     append_transcript("THINKING", reasoning)
+-                    assistant_message["reasoning"] = reasoning
++                    for _reasoning_key in _reasoning_history_keys():
++                        assistant_message[_reasoning_key] = reasoning
+ 
+                 if not tool_calls:
+                     if content:
+@@ -1900,11 +6916,87 @@ class ToolAgent:
+                         assistant_message["content"] = None
+ 
+                     if content or reasoning:
+-                        messages.append(assistant_message)
++                        if (
++                            not content
++                            and reasoning
++                            and _is_degenerate_text(reasoning)
++                        ):
++                            # A reasoning-only reply that is one character
++                            # repeated to the output cap is a serving fault, not
++                            # thinking: observed as exactly 6144 "!" from the
++                            # first token, with content_chars 0 and no tool
++                            # call, under speculative decoding. Keeping it cost
++                            # far more than the lost turn - 12k characters of
++                            # noise pushed the trimmer from 31 history messages
++                            # to 12, evicting real history, and the model then
++                            # concluded "my replies keep failing to emit the
++                            # tool call" and started writing shorter answers to
++                            # fix a formatting error it had not made.
++                            # transcript AND log: the transcript records it
++                            # where it happened, but a serving fault should be
++                            # visible while the run is going rather than only
++                            # on a later grep
++                            log.warning(
++                                "degenerate reasoning dropped: %d chars, no content "
++                                "and no tool call - the reply was a repetition loop. "
++                                "This is a serving fault, not the model reasoning.",
++                                len(reasoning),
++                            )
++                            append_transcript(
++                                "ANALYZER STATUS",
++                                "degenerate_reasoning_dropped: the reply was a "
++                                f"repetition loop ({len(reasoning)} chars) with no "
++                                "content or tool call, and was replaced in context.",
++                            )
++                            assistant_message = _mark_control_message(
++                                {"role": "assistant", "content": _DEGENERATE_CONTENT_STUB},
++                                "stub",
++                            )
++                        elif content and _is_degenerate_text(content):
++                            # a repetition loop feeds on its own output, so the
++                            # garbage must not reach the next request's context
++                            append_transcript(
++                                "ANALYZER STATUS",
++                                "degenerate_content_stubbed: assistant text was highly "
++                                "repetitive and was replaced in context.",
++                            )
++                            assistant_message = {
++                                "role": "assistant",
++                                "content": _DEGENERATE_CONTENT_STUB,
++                            }
++                        elif (
++                            not content
++                            and reasoning
++                            and _stub_dead_reasoning_enabled()
++                        ):
++                            # reasoning-only reply: nothing to continue from,
++                            # and re-sending it biases the retry toward the
++                            # same dead end. Transcript keeps the full text.
++                            assistant_message = _mark_control_message(
++                                {"role": "assistant", "content": _DEAD_REASONING_STUB},
++                                "stub",
++                            )
++                        self._append_context_message(messages, assistant_message)
+                     yielded_control_reason = control_yield_reason()
+                     if yielded_control_reason is not None:
+                         break
+                     followup_prefix = "You have not acted yet. Investigate first. "
++                    if truncated_tool_call:
++                        # the only signal the model gets that LENGTH, not
++                        # formatting, is why its call vanished
++                        followup_prefix = (
++                            "Your previous reply was CUT OFF before the tool call finished, so the "
++                            "call was incomplete and could not be executed. Keep your reasoning "
++                            "much shorter this time and emit the `python` tool call early enough "
++                            "that it completes within the output limit. Prefer one small snippet "
++                            "over a long analysis. "
++                        )
++                    elif malformed_argument_errors:
++                        followup_prefix = (
++                            "Your previous tool call had arguments that were not valid JSON, so it "
++                            "was not executed. Emit exactly one `python` tool call whose arguments "
++                            "are a well-formed JSON object. "
++                        )
+                     if tool_call_markup_in_text:
+                         followup_prefix = (
+                             "You did not call a tool. We detected `<tool_call>` markup inside your reasoning or assistant text, "
+@@ -1912,10 +7004,31 @@ class ToolAgent:
+                             "Emit exactly one `python` tool call directly as your next response. "
+                             "Do not place `<tool_call>` markup inside reasoning, explanation, or notes. "
+                         )
++                    # the clause names where transient facts SHOULD go, so it
++                    # holds only while that section is carried; a mode that
++                    # drops it would be pointing the model nowhere
++                    _transient_clause = (
++                        " \u2014 current positions and this turn's events go in "
++                        "`Recent findings:`. "
++                        if "Recent findings" in _advertised_section_labels()
++                        # "only" wants something to contrast against, and the
++                        # clause that supplied it names a section this mode has
++                        # dropped; keep the contrast, drop the destination
++                        else ", not current positions or what just happened. "
++                    )
+                     followup_prompt = (
+                         f"{followup_prefix}"
+                         "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
+-                        "If helpful, include short world-model update lines such as `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, or `Cross-level notes:`. "
++                        # the same narrowing the opener applies: advertising a section a
++                        # restricted mode drops invites the model to write
++                        # where it will never read it back
++                        f"If helpful, include memory update lines such as "
++                        f"{_section_list_phrase(_advertised_section_labels(), 'or')}. "
++                        "`World model:` holds durable environment rules"
++                        + (" only" if "Recent findings" in _advertised_section_labels() else "")
++                        + f"{_transient_clause}"
++                        "Each section you write replaces the stored one entirely, "
++                        "so restate what is still true, not only what is new. "
+                         "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
+                         "compare `previous_frame` to `current_frame` for the most recent change, "
+                         "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
+@@ -1923,7 +7036,12 @@ class ToolAgent:
+                         f"{TOOL_CALL_FORMAT_GUIDANCE}"
+                     )
+                     append_transcript("USER PROMPT", followup_prompt)
+-                    messages.append({"role": "user", "content": followup_prompt})
++                    self._append_context_message(
++                        messages,
++                        _mark_control_message(
++                            {"role": "user", "content": followup_prompt}, "nudge"
++                        )
++                    )
+                     continue
+ 
+                 if content:
+@@ -1931,7 +7049,8 @@ class ToolAgent:
+                     append_transcript("ASSISTANT", content)
+                     assistant_message["content"] = content
+                 assistant_message["tool_calls"] = tool_calls
+-                messages.append(assistant_message)
++                turn_tool_call_count += len(tool_calls)
++                self._append_context_message(messages, assistant_message)
+ 
+                 for tool_index, tool_call in enumerate(tool_calls):
+                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+@@ -1954,8 +7073,17 @@ class ToolAgent:
+                     dispatch = self._dispatch_tool(state_path, tool_name, arguments)
+                     if dispatch.step_executed:
+                         step_executed = True
++                        if self._reasoning_effort_rung >= 0 and dispatch.made_progress:
++                            # the turn achieved something, so restore the server
++                            # default; an inert action leaves the reduction in
++                            # place rather than inviting another truncation
++                            log.info(
++                                "action changed the board; restoring default reasoning_effort"
++                            )
++                            self._reasoning_effort_rung = -1
+                     append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))
+-                    messages.append(
++                    self._append_context_message(
++                        messages,
+                         {
+                             "role": "tool",
+                             "tool_call_id": tool_call.get("id", ""),
+@@ -1977,8 +7105,44 @@ class ToolAgent:
+                     break
+ 
+         except requests.RequestException as exc:
++            if _is_read_timeout(exc) and _yield_on_timeout_enabled():
++                # Keep this turn's completed exchanges and hand control back to
++                # the solver, which re-invokes on the same game state.
++                append_transcript(
++                    "ANALYZER STATUS",
++                    f"request_timeout (yielding, history preserved): {exc}",
++                )
++                log.warning(
++                    "analyzer request timed out at action %d; yielding with %d tool call(s) preserved: %s",
++                    display_action_num,
++                    turn_tool_call_count,
++                    exc,
++                )
++                self._resume_after_yield = True
++                self._resume_reason = "timeout"
++                if latest_request_messages is not None:
++                    _write_prompt_log_snapshot(
++                        prompt_log,
++                        model_id=self._model.model_id,
++                        base_url=self._model.base_url,
++                        display_action_num=display_action_num,
++                        analysis_step=analysis_step,
++                        request_index=latest_request_index,
++                        messages=latest_request_messages,
++                        tools=latest_request_tools,
++                        tool_choice=latest_request_tool_choice,
++                        transcript="".join(transcript_parts),
++                    )
++                # preserve_history stays True, so the finally block commits
++                # this turn's exchanges exactly as a normal yield would.
++                return AnalyzerTurnResult(
++                    step_executed=False,
++                    reasoning=captured_reasoning,
++                    yielded_control=True,
++                )
+             append_transcript("ANALYZER STATUS", f"request_error: {exc}")
+             preserve_history = False
++            self._session_generated_tokens = tokens_at_turn_start
+             if latest_request_messages is not None:
+                 _write_prompt_log_snapshot(
+                     prompt_log,
+@@ -1997,6 +7161,7 @@ class ToolAgent:
+         except Exception as exc:
+             append_transcript("ANALYZER STATUS", f"error: {exc}")
+             preserve_history = False
++            self._session_generated_tokens = tokens_at_turn_start
+             if latest_request_messages is not None:
+                 _write_prompt_log_snapshot(
+                     prompt_log,
+@@ -2013,10 +7178,15 @@ class ToolAgent:
+             log.warning("analyzer failed at action %d: %s", display_action_num, exc)
+             return None
+         finally:
++            if step_executed and not self._wm_absorbed_in_turn:
++                self._turns_without_wm_update += 1
+             if preserve_history:
+                 self._history_messages = self._persistent_history_messages(messages, tools=self._tools(state_path))
+             else:
+                 self._history_messages = previous_history_messages
++            solver_obj = getattr(self._step_env_callback, "__self__", None)
++            if solver_obj is not None and hasattr(solver_obj, "action_guard_hook"):
++                solver_obj.action_guard_hook = None
+             self._step_env_callback = None
+             self._current_valid_actions = []
+ 
+@@ -2036,6 +7206,7 @@ class ToolAgent:
+             f"request_safety_margin_tokens: {self._request_safety_margin_tokens}\n"
+             f"tool_output_tokens: {self._tool_output_tokens}\n"
+             f"yield_seconds: {self._yield_seconds if self._yield_seconds is not None else 'disabled'}\n"
++            f"yield_tokens: {self._yield_tokens if self._yield_tokens is not None else 'disabled'}\n"
+             f"available_tools: python\n"
+             f"python_timeout_seconds: {self._python_timeout}\n"
+             f"history_messages: {len(self._history_messages)}\n"
+@@ -2056,6 +7227,31 @@ class ToolAgent:
+                 tool_choice=latest_request_tool_choice,
+                 transcript="".join(transcript_parts),
+             )
++        # An invocation that executed nothing will be re-invoked by the solver
++        # on the same game state, so whatever it appends next is a duplicate
++        # restatement. This covers BOTH non-execution exits: the time budget
++        # (yielded_control_reason set) and the tool-step budget (loop condition
++        # went false, no yield reason). Execution and yielding are mutually
++        # exclusive, so `not step_executed` is the whole condition.
++        self._resume_after_yield = not step_executed
++        if yielded_control_reason is not None:
++            self._resume_reason = (
++                "yield_tools" if turn_tool_call_count > 0 else "yield_bare"
++            )
++        else:
++            self._resume_reason = (
++                "tool_steps" if turn_tool_call_count > 0 else "yield_bare"
++            )
++        if not step_executed and turn_tool_call_count == 0 and self._last_step_summary:
++            # no dispatch ran, so _dispatch_tool never marked the summary
++            # stale; without this the next opener re-narrates an older
++            # execution as if it had just happened (or claims nothing has run
++            # yet) directly beneath this turn's own reasoning.
++            self._last_step_summary = {
++                **self._last_step_summary,
++                "stale": True,
++                "stale_reason": "no_tool_call",
++            }
+         return AnalyzerTurnResult(
+             step_executed=step_executed,
+             reasoning=captured_reasoning,

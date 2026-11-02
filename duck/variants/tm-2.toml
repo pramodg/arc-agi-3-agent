@@ -1,0 +1,26 @@
+# tm-2: tm-1 with round-2 settings (two-mode-player, docs/two-mode-player.md,
+# "Round 2"): the time box needs actions since the last clear, understand
+# thinks less, the executor hands back after two unmet expectations.
+base = "tm-1"
+
+# The notebook's opening markdown cell, whole.
+intro = '''### Our fork of Franzen's ARC-AGI-3 Milestone 2 solution
+
+This is the arc-agi-3 project's fork of
+[dfranzen/arc-agi-3-milestone-2-solution](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution),
+built by `scripts/build_duck_notebook.py`. All credit for the solver goes to
+Jeroen Cottaar and Tufa Labs (the Duck harness) and to Daniel Franzen (the
+patch and launcher). Our changes: the model server may take
+40 minutes to start instead of 12, and a commit run outside a competition
+rerun skips the server and the demo games and writes a stand-in
+submission.parquet. The solved-level memory of
+[vickyfym/arc-agi-3-lalalia-final](https://www.kaggle.com/code/vickyfym/arc-agi-3-lalalia-final)
+(lalalia9, after rellik13 / sirikilohit) is added in the customization cell,
+and the harness's no-op repeat guard is switched on. Licences: see `duck/NOTICE` in our repository.
+
+**tm-2:** tm-1 (two-mode player: recognise, understand, test, hand off to a fast thinking-off executor, time-box) with round-2 settings: the time box waits for enough actions since the last clear, the understand request thinks less, and the executor hands back after two unmet expectations instead of one. See docs/two-mode-player.md in our repository.'''
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/round2.py"
+gated = true

@@ -1,0 +1,34 @@
+# pace-accept: V3 with speculative decoding accepting a draft token a little
+# more readily (time-per-game, docs/time-per-game.md). Token generation is
+# the biggest share of a game's wall time; V3 accepts 3.1 of 4 drafted tokens
+# per step. The thresholds drop from 1.0 to 0.8 (single) and 0.9
+# (accumulated), as speed-serve tried, but the draft length stays at 4.
+base = "v3"
+
+# The notebook's opening markdown cell, whole.
+intro = '''
+### Our fork of Franzen's ARC-AGI-3 Milestone 2 solution
+
+This is the arc-agi-3 project's fork of
+[dfranzen/arc-agi-3-milestone-2-solution](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution),
+built by `scripts/build_duck_notebook.py`. All credit for the solver goes to
+Jeroen Cottaar and Tufa Labs (the Duck harness) and to Daniel Franzen (the
+patch and launcher). Our changes: the model server may take
+40 minutes to start instead of 12, and a commit run outside a competition
+rerun skips the server and the demo games and writes a stand-in
+submission.parquet. The solved-level memory of
+[vickyfym/arc-agi-3-lalalia-final](https://www.kaggle.com/code/vickyfym/arc-agi-3-lalalia-final)
+(lalalia9, after rellik13 / sirikilohit) is added in the customization cell,
+and the harness's no-op repeat guard is switched on. Licences: see `duck/NOTICE` in our repository.
+
+**pace-accept:** speculative decoding accepts a drafted token a little more readily (docs/time-per-game.md in our repository).'''
+
+[[env]]
+cell = "# Paste this entire file into the launcher cell."
+old = "    SPEC_ACCEPT_SINGLE=1.0,\n"
+new = "    SPEC_ACCEPT_SINGLE=0.8,  # pace: was 1.0\n"
+
+[[env]]
+cell = "# Paste this entire file into the launcher cell."
+old = "    SPEC_ACCEPT_ACC=1.0,\n"
+new = "    SPEC_ACCEPT_ACC=0.9,  # pace: was 1.0\n"

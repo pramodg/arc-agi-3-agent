@@ -1,0 +1,24 @@
+# V3: the no-op repeat guard switched on (duck-climb-a). One line joins
+# Franzen's "guards" settings in the env cell.
+base = "v2"
+
+# The notebook's opening markdown cell, whole.
+intro = '''
+### Our fork of Franzen's ARC-AGI-3 Milestone 2 solution
+
+This is the arc-agi-3 project's fork of
+[dfranzen/arc-agi-3-milestone-2-solution](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution),
+built by `scripts/build_duck_notebook.py`. All credit for the solver goes to
+Jeroen Cottaar and Tufa Labs (the Duck harness) and to Daniel Franzen (the
+patch and launcher). Our changes: the model server may take
+40 minutes to start instead of 12, and a commit run outside a competition
+rerun skips the server and the demo games and writes a stand-in
+submission.parquet. The solved-level memory of
+[vickyfym/arc-agi-3-lalalia-final](https://www.kaggle.com/code/vickyfym/arc-agi-3-lalalia-final)
+(lalalia9, after rellik13 / sirikilohit) is added in the customization cell,
+and the harness's no-op repeat guard is switched on. Licences: see `duck/NOTICE` in our repository.'''
+
+[[env]]
+old = "    'ARC3_STALE_STATE_BLOCK': '1',\n"
+new = "    'ARC3_STALE_STATE_BLOCK': '1',\n    'ARC3_NOOP_REPEAT_GUARD': '1',  # duck-climb-a V3: was off (Franzen's default)\n"
+absent = "ARC3_NOOP_REPEAT_GUARD"

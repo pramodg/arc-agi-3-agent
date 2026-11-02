@@ -1,0 +1,88 @@
+# tm-1: the two-mode player (two-mode-player, docs/two-mode-player.md).
+# Recognise, understand, test, hand off, time-box. Built on pace-accept with
+# the solved-level replay swapped for the rules note, as bm-rules does
+# (the ks-1 stack had not landed when this was built). Landed cells are
+# pasted as they are; only the four new parts live under duck/twomode/.
+base = "pace-accept"
+
+# The notebook's opening markdown cell, whole.
+intro = '''### Our fork of Franzen's ARC-AGI-3 Milestone 2 solution
+
+This is the arc-agi-3 project's fork of
+[dfranzen/arc-agi-3-milestone-2-solution](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution),
+built by `scripts/build_duck_notebook.py`. All credit for the solver goes to
+Jeroen Cottaar and Tufa Labs (the Duck harness) and to Daniel Franzen (the
+patch and launcher). Our changes: the model server may take
+40 minutes to start instead of 12, and a commit run outside a competition
+rerun skips the server and the demo games and writes a stand-in
+submission.parquet. The solved-level memory of
+[vickyfym/arc-agi-3-lalalia-final](https://www.kaggle.com/code/vickyfym/arc-agi-3-lalalia-final)
+(lalalia9, after rellik13 / sirikilohit) is added in the customization cell,
+and the harness's no-op repeat guard is switched on. Licences: see `duck/NOTICE` in our repository.
+
+**tm-1:** speculative decoding accepts a drafted token a little more readily (pace-accept), each solved level keeps a short rules note instead of its last actions (as in bm-rules), and the player runs in two modes: recognise a game or level as familiar or new; understand a new one in writing (problem, parts, connections, win condition); test a few hypotheses with a few moves each; hand a general-rules-only rulebook to a fast thinking-off executor that hands back at its first surprise; and time-box each game. See docs/two-mode-player.md in our repository.'''
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/bigmodel/rules_memory.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/r3/hook.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/r3/lives.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/bigmodel/playbook.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/staged/questions.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/r4/stall.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/hypothesis/ledger.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twotier/sandbox.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/recognise.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/understand.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/rulebook.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/executor.py"
+gated = true
+
+[[cells]]
+after = "# Make one-off changes to `bm`"
+file = "duck/twomode/player.py"
+gated = true

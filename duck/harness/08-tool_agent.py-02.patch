@@ -1,0 +1,1073 @@
+@@ -215,6 +360,1324 @@ def _display_action_number(action_num: int) -> int:
+     return max(1, int(action_num) + 1)
+ 
+ 
++def _stale_summary_lines(summary: dict[str, Any]) -> list[str]:
++    """Rendering for a step summary carried over from an earlier exchange of
++    the same turn. States that explicitly instead of re-narrating the old
++    outcome as if it had just happened. Two ways a turn can reach here:
++    a snippet ran and executed nothing (default wording), or the exchange
++    produced no tool call at all (stale_reason='no_tool_call') - in which case
++    claiming a snippet ran would be false."""
++    if summary.get("stale_reason") == "no_tool_call":
++        lines = [
++            "Your previous exchange this turn produced no tool call and "
++            "executed no actions."
++        ]
++    else:
++        lines = [
++            "Your last python snippet executed NO actions (it only computed or "
++            "inspected state - that is fine)."
++        ]
++    executed_actions = summary.get("executed_actions")
++    rendered = ""
++    if isinstance(executed_actions, list):
++        rendered = ", ".join(
++            str(name).strip() for name in executed_actions[:10] if str(name).strip()
++        )
++    if summary.get("game_over"):
++        fatal = str(summary.get("fatal_action") or "")
++        lines.append(
++            "Reminder of the still-pending outcome from earlier this turn: the "
++            f"executed sequence ({rendered or 'see earlier message'}) ended in "
++            "GAME OVER"
++            + (f" after '{fatal}'" if fatal else "")
++            + "; the level was auto-reset and you are planning the fresh attempt "
++            "now. Do NOT re-submit that sequence - the full diagnosis "
++            "instructions were given in an earlier message this turn."
++        )
++    elif summary.get("level_transition"):
++        lines.append(
++            "Reminder: the earlier sequence this turn completed the level; you "
++            "are now on the new level."
++        )
++    elif rendered:
++        lines.append(
++            "For reference, the most recent executed sequence earlier this turn "
++            f"was: {rendered}."
++        )
++    return lines
++
++
++def _state_identity_border() -> int:
++    """Border cropped when deciding whether two boards are THE SAME STATE.
++
++    Distinct from ARC3_NOOP_GUARD_BORDER, which asks a different question. The
++    batch stop asks "did this action accomplish anything meaningful", and there
++    cropping the HUD is right: a timer ticking down is not progress. The repeat
++    guards and the death ledger ask "have I been here before", and there
++    cropping is a liability - two boards with identical interiors but different
++    HUD are treated as one state, so a mechanic gated on anything the HUD
++    encodes (a countdown, a phase, a collected count) can be mis-recorded. The
++    resulting block is permanent and self-sealing: the action never executes,
++    so no evidence can arrive to correct it.
++
++    Defaults to 0 - exact whole-frame matching, which is safe by construction
++    and matches the reference implementation. Raise it to trade that guarantee
++    for more matches."""
++    return max(0, _get_env_int("ARC3_STATE_IDENTITY_BORDER", 0))
++
++
++def _interior_state_hash(grid: list[list[int]]) -> str:
++    """Hash identifying whether two boards are the same state, for the repeat
++    guards and the death ledger. Crops ARC3_STATE_IDENTITY_BORDER cells, which
++    defaults to 0 - the whole frame, HUD included. Small grids hash whole."""
++    import hashlib
++
++    border = _state_identity_border()
++    rows = len(grid)
++    cols = max((len(row) for row in grid), default=0)
++    if rows > 2 * border and cols > 2 * border:
++        core = [tuple(row[border:cols - border]) for row in grid[border:rows - border]]
++    else:
++        core = [tuple(row) for row in grid]
++    return hashlib.sha1(repr(core).encode("utf-8")).hexdigest()
++
++
++_LEAKED_TOOLCALL_RE = None
++
++
++def _extract_leaked_tool_calls(message: dict[str, Any]) -> dict[str, Any]:
++    """Fallback for servers without a tool-call parser for the model's
++    dialect: when a response carries no structured tool_calls but the content
++    contains Nemotron-style <TOOLCALL>[{...}]</TOOLCALL> markup, parse it and
++    synthesize the OpenAI-shaped tool_calls the harness expects. Malformed
++    payloads leave the message untouched. Disable with
++    ARC3_TOOLCALL_TEXT_FALLBACK=0."""
++    global _LEAKED_TOOLCALL_RE
++    if not _get_env_bool("ARC3_TOOLCALL_TEXT_FALLBACK", True):
++        return message
++    if not isinstance(message, dict) or message.get("tool_calls"):
++        return message
++    content = message.get("content")
++    if not isinstance(content, str) or "<TOOLCALL>" not in content:
++        return message
++    import json as _json
++    import re as _re
++    import uuid as _uuid
++
++    if _LEAKED_TOOLCALL_RE is None:
++        _LEAKED_TOOLCALL_RE = _re.compile(
++            r"<TOOLCALL>\s*(\[.*?\])\s*</TOOLCALL>", _re.DOTALL
++        )
++    match = _LEAKED_TOOLCALL_RE.search(content)
++    if match is None:
++        return message
++    try:
++        parsed = _json.loads(match.group(1))
++    except _json.JSONDecodeError:
++        return message
++    if not isinstance(parsed, list):
++        parsed = [parsed]
++    calls: list[dict[str, Any]] = []
++    for item in parsed:
++        if not isinstance(item, dict) or not item.get("name"):
++            continue
++        arguments = item.get("arguments", {})
++        if not isinstance(arguments, str):
++            arguments = _json.dumps(arguments, ensure_ascii=False)
++        calls.append(
++            {
++                "id": f"call_{_uuid.uuid4().hex}",
++                "type": "function",
++                "function": {
++                    "name": str(item["name"]),
++                    "arguments": arguments,
++                },
++            }
++        )
++    if not calls:
++        return message
++    remainder = (content[: match.start()] + content[match.end():]).strip()
++    updated = dict(message)
++    updated["tool_calls"] = calls
++    updated["content"] = remainder or None
++    return updated
++
++
++def _env_int(name: str, default: int) -> int:
++    """A numeric override that cannot take the run down on a typo."""
++    try:
++        return int(os.environ.get(name, "") or default)
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(os.environ.get(name, "") or default)
++    except (TypeError, ValueError):
++        return default
++
++
++_RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504, 520, 522, 524}
++# Establishing a TCP connection is fast or it is not happening: a server that
++# has exited refuses instantly, and one that is unreachable will not become
++# reachable inside the read budget. Separate from the read timeout so a dead
++# endpoint fails in seconds rather than waiting out the generation budget.
++_CONNECT_TIMEOUT_SECONDS = 10.0
++
++
++def _http_retry_delay_seconds(
++    attempt: int,
++    retry_after: str | None,
++    base_seconds: float,
++    max_seconds: float = 60.0,
++) -> float:
++    """Exponential backoff with jitter, or the server's Retry-After when it
++    parses as a number and asks for longer. Capped at 60s per wait.
++
++    Retry-After raises the wait, never lowers it. A provider under load can
++    answer `Retry-After: 1` to every request - observed at 100 consecutive
++    retries roughly 1.3s apart - and honouring that literally means hammering
++    an endpoint that has already said no, which neither clears the rate limit
++    nor helps the run. The configured base is the floor; the server can still
++    ask for more.
++    """
++    backoff = min(max_seconds, base_seconds * (2 ** attempt)) + random.uniform(0.0, 1.0)
++    if retry_after:
++        try:
++            # max_seconds caps the exponential, not an explicit request from the
++            # server: a Retry-After of 30 against a 5s ceiling still waits 30,
++            # because the endpoint said so and hammering it earlier helps no one
++            return max(backoff, min(60.0, float(retry_after)))
++        except ValueError:
++            pass
++    return backoff
++
++
++def _post_with_retries(
++    post_fn,
++    *,
++    retries: int,
++    base_seconds: float,
++    max_seconds: float = 60.0,
++    initial_seconds: float = 0.0,
++    sleep=time.sleep,
++    monotonic=time.monotonic,
++):
++    """Retry transient HTTP failures (rate limits, gateway errors) in place,
++    BEFORE they escalate to turn abort + history rollback. Returns the final
++    response either way; non-retryable statuses return immediately and flow
++    into the existing error handling. Rate-limit retries here preserve the
++    turn's partial tool work, which the abort path deliberately discards."""
++    # A negative count means keep trying. Zero keeps its obvious meaning - do
++    # not retry - so a typo disables retries rather than hanging the run.
++    unlimited = retries < 0
++    budget = max(0, retries)
++    # A floor on total retry time, used once. On Kaggle the benchmark is
++    # released before the server has finished loading, so the first request of
++    # every game meets a refused connection and has to wait it out - minutes,
++    # not the seconds the ordinary budget allows. Expressed as time rather than
++    # a count because the count that covers a 15-minute load would be absurd at
++    # any sensible delay, and would then apply to every later failure too.
++    started_at = monotonic()
++
++    def _budget_label(attempt_index: int) -> str:
++        """What the log should call the limit. Only reached outside a grace
++        period now - inside one the retry lines are suppressed entirely, since
++        "1/3" describes a budget that is not the one in force."""
++        if unlimited:
++            return "unlimited"
++        if attempt_index >= budget:
++            return f"{initial_seconds:.0f}s grace"
++        return str(budget)
++
++    def _exhausted(attempt_index: int) -> bool:
++        if unlimited:
++            return False
++        if attempt_index < budget:
++            return False
++        return (monotonic() - started_at) >= initial_seconds
++
++    def _announce_grace(reason: str) -> None:
++        """Said once, on the first failure, so the grace is visible from the
++        start. Without it the log shows three ordinary-looking retries before
++        the "Ns grace" label appears, and a reader watching a cold start cannot
++        tell a long wait from a broken one."""
++        nonlocal announced
++        if announced or initial_seconds <= 0:
++            return
++        announced = True
++        log.warning(
++            "first analyzer request failed (%s); retrying for up to %.0fs while "
++            "the endpoint comes up, then falling back to %d retries per request",
++            reason, initial_seconds, budget,
++        )
++
++    announced = False
++    response = None
++    attempt = -1
++    while True:
++        attempt += 1
++        try:
++            response = post_fn()
++        except requests.exceptions.RequestException as exc:
++            # The server was never reached - refused, DNS, a socket error, or a
++            # connect timeout. Without this the exception leaves the turn
++            # entirely and the analyzer-level retry starts it over, discarding
++            # whatever tool work it had already done; retrying the request in
++            # place keeps it. A ReadTimeout is deliberately not caught: the
++            # response body stalled, which has its own path that can yield with
++            # history preserved.
++            if _is_read_timeout(exc) or _exhausted(attempt):
++                raise
++            _announce_grace(type(exc).__name__)
++            delay = _http_retry_delay_seconds(attempt, None, base_seconds, max_seconds)
++            # Silent while the grace is carrying the loop: at 14 games polling a
++            # cold endpoint every 5s for 15 minutes this line alone would be
++            # ~2,500 entries, burying everything else. The announcement above
++            # already said a wait is in progress, and the outcome is logged when
++            # the loop ends either way.
++            if initial_seconds <= 0:
++                log.warning(
++                    "analyzer endpoint unreachable (%s); retry %d/%s in %.1fs",
++                    type(exc).__name__, attempt + 1, _budget_label(attempt), delay,
++                )
++            sleep(delay)
++            continue
++        status = getattr(response, "status_code", 200)
++        if status not in _RETRYABLE_HTTP_STATUSES or _exhausted(attempt):
++            return response
++        _announce_grace(f"HTTP {status}")
++        retry_after = None
++        headers = getattr(response, "headers", None)
++        if headers is not None:
++            retry_after = headers.get("Retry-After")
++        delay = _http_retry_delay_seconds(attempt, retry_after, base_seconds, max_seconds)
++        if initial_seconds <= 0:
++            log.warning(
++                "analyzer endpoint returned HTTP %s; retry %d/%s in %.1fs",
++                status, attempt + 1, _budget_label(attempt), delay,
++            )
++        sleep(delay)
++    return response
++
++
++_CONTROL_MESSAGE_KEY = "_arc3_control"
++
++_YIELD_RESUME_PROMPT_WITH_TOOLS = (
++    "You yielded control on the turn time budget. Your tool results above are "
++    "still valid - do NOT restart your analysis or re-inspect the board from "
++    "scratch. Continue from them and call `action(actions)` with your best "
++    "next action or short batch."
++)
++
++_YIELD_RESUME_PROMPT_WITH_TOOLS_NEUTRAL = (
++    "You yielded control on the turn time budget. This is a scheduling "
++    "interruption, not a signal that your analysis is complete. Your tool "
++    "results above are still valid - do NOT restart or re-inspect the board "
++    "from scratch. Pick up where you left off: keep investigating if you still "
++    "need to, and call `action(actions)` once your evidence supports a choice."
++)
++
++
++def _yield_resume_tone() -> str:
++    """Wording for the commonest resumption message.
++
++    'commit' (default) is the original text, which reads as though the model
++    has finished: it asks for the best next action. At a 60s budget that fires
++    after very little deliberation, so it can push a commitment the evidence
++    does not yet support.
++
++    'neutral' keeps the load-bearing part - do not restart, your results are
++    valid - while naming the interruption for what it is and leaving the
++    decision to continue investigating open. The anti-stall backstops are
++    untouched: the no-tool-call nudge, the tool-step-exhaustion prompt and the
++    timeout prompt all still push to act, and they fire on exhausted work
++    rather than on elapsed time.
++
++    'minimal' goes further and does not mention the yield at all. A yield that
++    executed nothing and a snippet that only inspected are the same situation
++    from the model's side - nothing happened, carry on - and the scheduling
++    reason is harness detail it cannot act on. The wording echoes the mid-turn
++    stale opener so a resumption reads as a continuation rather than as its own
++    kind of event, keeping only the part that is load-bearing: the earlier
++    results are still good.
++
++    Read the arm as actions performed against tokens generated: the change
++    should raise tokens per action if it is working as intended, and the
++    question is whether the actions get better.
++    """
++    tone = os.environ.get("ARC3_YIELD_RESUME_TONE", "").strip().lower()
++    return tone if tone in ("neutral", "minimal") else "commit"
++
++_YIELD_RESUME_PROMPT_NO_TOOLS = (
++    "You spent the entire turn budget reasoning without calling a tool. Stop "
++    "deliberating and call the `python` tool NOW: inspect "
++    "`current_frame.segmentation`, then call `action(actions)` with the best "
++    "available action. Acting on a partial model beats another turn of "
++    "analysis."
++)
++
++_YIELD_RESUME_PROMPT_WITH_TOOLS_MINIMAL = (
++    # Says nothing about yielding. From the model's side a yield with nothing
++    # executed and an inspect-only snippet are the same situation - nothing
++    # happened, carry on - and the scheduling reason is harness detail it
++    # cannot act on. Deliberately echoes the mid-turn stale opener it already
++    # sees often, so a resumption reads as a continuation rather than as a
++    # distinct kind of message. Kept: the earlier results are still good, so
++    # do not start over.
++    "Your last python snippet executed no actions (it only computed or "
++    "inspected state - that is fine). Your tool results above are still "
++    "valid: continue from them rather than re-inspecting the board from "
++    "scratch."
++)
++
++_YIELD_RESUME_PROMPT_NO_TOOLS_MINIMAL = (
++    # The with-tools wording would be false here: there was no snippet at all,
++    # so there are no results to continue from and the useful instruction is
++    # where to start instead.
++    "Your previous exchange produced no tool call and executed no actions. "
++    "Start with the `python` tool: inspect `current_frame.segmentation`, then "
++    "call `action(actions)` when your evidence supports a choice."
++)
++
++_YIELD_RESUME_PROMPT_NO_TOOLS_NEUTRAL = (
++    # The same edit as the with-tools pair: keep what is load-bearing - that
++    # nothing executed, and the concrete first step - and drop the pressure to
++    # commit. This fires when the yield budget expired on a turn that never
++    # called a tool, so the model really did spend the turn reasoning; what is
++    # unwarranted is telling it that acting on a partial model is better, when
++    # the budget expiring says nothing about whether its analysis was close.
++    "You yielded control on the turn time budget without calling a tool. This "
++    "is a scheduling interruption, not a signal that your analysis is complete "
++    "- but nothing has been executed and the board is unchanged. Start with "
++    "the `python` tool: inspect `current_frame.segmentation`, then call "
++    "`action(actions)` once your evidence supports a choice."
++)
++
++_DEAD_REASONING_STUB = "(previous attempt produced no tool call)"
++
++_DEGENERATE_CONTENT_STUB = (
++    "(previous reply was highly repetitive and has been omitted; do not "
++    "continue that pattern - write concise plain prose)"
++)
++
++_STATE_ONLY_CAPTION = (
++    # Leads with the assurance rather than with "Current board state":
++    # _build_user_message appends its own "Current grid image:" immediately
++    # below, so opening with a second caption put two labels for one picture
++    # next to each other. The load-bearing part is that the opener has not
++    # gone stale, not that a board follows.
++    "Nothing has been executed since the turn opener above, so the step, "
++    "level and valid actions stated there still hold."
++)
++
++
++def _yield_resume_prompt_mode() -> str:
++    """How a resumed turn re-opens.
++
++    'full'       (default) rebuild the complete opener - 2-3k tokens restating
++                 state the retained opener already carries.
++    'short'      a brief continuation sentence and nothing else.
++    'state_only' the continuation sentence plus a one-line caption and the
++                 CURRENT board image(s). Measurements showed 'short' holding up
++                 while images were attached and degrading without them, which
++                 is consistent with the omitted text (batch summary, state
++                 line, diffs, ledger) being what the image was covering for.
++                 This mode makes that explicit: drop the boilerplate, keep the
++                 state, in the cheapest form available.
++    """
++    mode = os.environ.get("ARC3_YIELD_RESUME_PROMPT", "").strip().lower()
++    return mode if mode in ("short", "state_only") else "full"
++
++
++_RESUME_PROMPT_TIMEOUT = (
++    "The previous request to the model timed out and was abandoned. Your tool "
++    "results above are still valid - do NOT restart your analysis. Continue "
++    "from them and call `action(actions)` with your best next action, keeping "
++    "your reasoning short so the next request completes."
++)
++
++_RESUME_PROMPT_TOOL_STEPS_EXHAUSTED = (
++    "You used every available tool step this turn without calling "
++    "`action(actions)`. Your tool results above are still valid - do NOT begin "
++    "a new investigation. Act NOW with the best option you already have."
++)
++
++
++def _yield_resume_prompt(reason: str) -> str:
++    """Continuation text for a resumed turn, chosen by why it ended.
++
++    'timeout'      - the request exceeded the analyzer read timeout: the work
++                     already done this turn is intact, the model just needs to
++                     wrap up quickly.
++    'tool_steps'   - the step budget ran out mid-investigation: results exist,
++                     the missing thing is the action.
++    'yield_tools'  - the time budget ran out with tool work done: same premise,
++                     softer framing.
++    'yield_bare'   - the turn produced only reasoning, so there is nothing
++                     above to continue from and the useful instruction is to
++                     stop deliberating.
++    """
++    if reason == "timeout":
++        return _RESUME_PROMPT_TIMEOUT
++    if reason == "tool_steps":
++        return _RESUME_PROMPT_TOOL_STEPS_EXHAUSTED
++    tone = _yield_resume_tone()
++    if reason == "yield_tools":
++        if tone == "minimal":
++            return _YIELD_RESUME_PROMPT_WITH_TOOLS_MINIMAL
++        return (
++            _YIELD_RESUME_PROMPT_WITH_TOOLS_NEUTRAL
++            if tone == "neutral"
++            else _YIELD_RESUME_PROMPT_WITH_TOOLS
++        )
++    if tone == "minimal":
++        return _YIELD_RESUME_PROMPT_NO_TOOLS_MINIMAL
++    return (
++        _YIELD_RESUME_PROMPT_NO_TOOLS_NEUTRAL
++        if tone == "neutral"
++        else _YIELD_RESUME_PROMPT_NO_TOOLS
++    )
++
++
++def _fatal_lookahead_enabled() -> bool:
++    """Block a batch that replays a recorded fatal path BEFORE spending any of
++    its actions, rather than running the harmless prefix and refusing only the
++    final move.
++
++    Default off keeps the per-position behaviour: the prefix executes and the
++    model ends up at the brink, which costs those actions but leaves it
++    somewhere it can still choose differently. With lookahead on, nothing is
++    spent and the model must resubmit a shorter batch to reach that point."""
++    return _get_env_bool("ARC3_DEATH_GUARD_LOOKAHEAD", False)
++
++
++def _yield_on_timeout_enabled() -> bool:
++    """Treat an analyzer read timeout as a yield instead of a failed turn.
++
++    The default path clears preserve_history, so the whole invocation's tool
++    calls and results are rolled back and the retry re-derives them from
++    scratch - on Kaggle that is a ~900s round trip discarded. Nothing can have
++    executed when a timeout fires (an executing dispatch breaks the loop before
++    another request is issued), so preserving the exchanges is safe: history
++    ends on a tool message and the resumed invocation appends a user message,
++    exactly the shape every yielded turn already produces.
++
++    Scoped to read timeouts only. Connection errors and HTTP failures keep the
++    rollback path, and context-overflow handling is untouched - preserving an
++    over-long context would just reproduce the failure."""
++    return _get_env_bool("ARC3_YIELD_ON_TIMEOUT", True)
++
++
++def _is_read_timeout(exc: BaseException) -> bool:
++    """requests raises ReadTimeout for a stalled response body; ConnectTimeout
++    (a sibling of the same base) means the server was never reached, so it is
++    deliberately excluded."""
++    return isinstance(exc, requests.exceptions.ReadTimeout)
++
++
++def _stub_dead_reasoning_enabled() -> bool:
++    """Replace reasoning-only assistant replies (no tool calls, no content)
++    with a short stub IN-TURN. Without this the dead trace is re-sent on every
++    later request of the same turn - observed at ~35k characters, truncated
++    mid-sentence by finish_reason=length, i.e. a broken thought replayed as
++    context."""
++    return _get_env_bool("ARC3_STUB_DEAD_REASONING", False)
++
++
++_HISTORY_IMAGE_PLACEHOLDER = "[grid image omitted from history]"
++
++
++def _history_image_keep() -> int | None:
++    """How many of the most recent image-bearing history MESSAGES keep their
++    images. None (unset) preserves today's behavior - images accumulate for as
++    long as their message is retained, ~400 tokens each at
++    MULTIMODAL_UPSCALE=10. 0 strips every image from history, so only the
++    current turn is visual. Counting per message rather than per image keeps a
++    multi-image turn (game-over visuals) together in one slot."""
++    raw = os.environ.get("ARC3_HISTORY_IMAGE_KEEP", "").strip()
++    if not raw:
++        return None
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return None
++
++
++def _resume_prompt_images_enabled() -> bool:
++    """Whether a resumption message re-attaches the grid image. A resumption
++    only happens when nothing executed, so the board is identical to the one
++    the retained opener already showed; skipping it saves an image per
++    resumption and stops resumptions from occupying history retention slots.
++    Default True = today's behavior."""
++    return _get_env_bool("ARC3_RESUME_PROMPT_IMAGES", True)
++
++
++def _message_has_image(message: dict[str, Any]) -> bool:
++    content = message.get("content")
++    if not isinstance(content, list):
++        return False
++    return any(
++        isinstance(part, dict) and part.get("type") == "image_url"
++        for part in content
++    )
++
++
++def _strip_message_images(message: dict[str, Any]) -> dict[str, Any]:
++    """Replace image parts with a short text marker. The marker keeps the
++    message well formed (a message whose only part was an image would
++    otherwise be empty) and tells the model a visual was there rather than
++    silently showing a turn that never had one."""
++    content = message.get("content")
++    if not isinstance(content, list):
++        return message
++    parts: list[Any] = []
++    for part in content:
++        if isinstance(part, dict) and part.get("type") == "image_url":
++            parts.append({"type": "text", "text": _HISTORY_IMAGE_PLACEHOLDER})
++        else:
++            parts.append(part)
++    return {**message, "content": parts}
++
++
++def _apply_history_image_window(
++    messages: list[dict[str, Any]], keep: int
++) -> list[dict[str, Any]]:
++    """Keep images on the `keep` most recent image-bearing messages, strip the
++    rest. Walks backwards so recency wins; originals are never mutated."""
++    seen = 0
++    result: list[dict[str, Any]] = []
++    for message in reversed(messages):
++        if _message_has_image(message):
++            seen += 1
++            if seen > keep:
++                message = _strip_message_images(message)
++        result.append(message)
++    result.reverse()
++    return result
++
++
++# Tag for the pair of messages a rolling summary is made of: the request that
++# asks for it and the reply that is it. Deliberately absent from
++# _CONTROL_KIND_ENV, so no pruning knob can remove them - the trimmer's
++# summary-aware drain navigates by these, and losing one would silently return
++# it to ordinary block dropping.
++_SUMMARY_CONTROL_KIND = "summary"
++# Below this a reply that also called a tool is a preamble rather than a
++# summary. Real ones measured 4,385 to 6,248 characters; an introduction to a
++# tool call measured nine.
++_SUMMARY_MIN_USABLE_CHARS = 500
++
++
++def _summary_interval_tokens() -> int:
++    """New context tokens between summary attempts, successful or not. 0 disables.
++
++    Count newly appended prompts, assistant messages (including reasoning), tool
++    results and images, excluding the summary exchange itself. Re-sending or
++    evicting existing history does not change this counter.
++
++    The model is asked for a summary on a schedule rather than when it feels
++    like one. Measured across a run where the prompt asked for a note every
++    turn: one game in fourteen complied consistently, and the rest wrote
++    something on roughly half their replies - so a mechanism that depends on
++    the model choosing to summarise does not get summaries.
++
++    Each summary is generated from live context, which keeps both the KV prefix
++    and the recurrent state intact - a summary built from a truncated prefix
++    would force a full prefill, and recurrent state cannot be rewound the way a
++    KV prefix can be reused.
++
++    The summary is appended when it is made, so every later turn is generated
++    with it already present. Nothing is ever inserted underneath a message that
++    was produced without it.
++    """
++    return max(0, _get_env_int("ARC3_SUMMARY_INTERVAL_TOKENS", 0))
++
++
++def _drain_stop_at_summaries() -> bool:
++    """Whether the drain may stop early on a summary.
++
++    The drain normally evicts from the budget down to budget-minus-drain in one
++    go. With this on it stops sooner when the head is already a summary request
++    and the request is back under budget - so the retained history starts with a
++    digest of everything dropped, without evicting a token more than the
++    ordinary drain would.
++
++    The earlier design made summaries the ONLY boundary, which could not
++    overshoot in the good case but removed two intervals at once whenever a
++    summary had failed - 38% of a 42k window at an 8k interval. Here the drain
++    target still bounds the drop, so the worst case is exactly today's
++    behaviour and the summary is an early exit rather than the sole exit.
++
++    The trade is coverage: when no summary falls inside the drain range the drop
++    stops mid-span with the previous summary already gone, and that stretch has
++    nothing standing in for it. So ARC3_SUMMARY_INTERVAL_TOKENS wants to be
++    comfortably SMALLER than ARC3_CONTEXT_DRAIN_TOKENS - several candidates per
++    drop - which is the opposite of sizing the interval to replace the drain.
++    """
++    return _get_env_bool("ARC3_DRAIN_STOP_AT_SUMMARIES", False)
++
++
++def _hide_followup_summaries() -> bool:
++    """Send only the first summary in history, hiding the rest.
++
++    Each summary covers everything before it, so a later one restates an
++    earlier one's material - measured at 1 or 2 carried per request, 4,496
++    characters each, so roughly 6% of a 42k window at worst.
++
++    Applied to the wire and to the estimate, never to the stored history: the
++    hidden ones stay so that when eviction removes the first, the next becomes
++    the first and appears. Dropping them at commit would delete what it meant
++    to hide.
++
++    The cost is the thing the rolling design otherwise avoids. A hidden summary
++    is absent while the turns after it are generated and becomes their head
++    later, so those messages end up under something that was not there when
++    they were written - which is exactly the rearrangement the append-only
++    scheme was built to prevent.
++    """
++    return _get_env_bool("ARC3_HIDE_FOLLOWUP_SUMMARIES", False)
++
++
++def _apply_summary_visibility(
++    messages: list[dict[str, Any]], *, evicted: bool
++) -> list[dict[str, Any]]:
++    """Hide completed summaries, preserving a pending final summary request.
++
++    Before the first eviction no completed summaries are shown. What they
++    cover is still in context verbatim, so a summary there is pure duplication.
++    Hiding them all means appending one does not change the prompt, leaving the fill
++    phase a perfect append with a prefix that never moves. The first summary
++    appears when eviction starts, which invalidates the prefix anyway.
++    """
++    if not _hide_followup_summaries():
++        return messages
++
++    # The request currently asking for a summary has no reply yet. It must
++    # reach the model even when completed summaries are hidden. Split it off
++    # without mutating the input; only stored pairs participate in visibility.
++    pending_request: list[dict[str, Any]] = []
++    history = messages
++    if (
++        messages
++        and _message_is_summary(messages[-1])
++        and str(messages[-1].get("role", "")).strip() == "user"
++    ):
++        pending_request = messages[-1:]
++        history = messages[:-1]
++    if not evicted:
++        return [m for m in history if not _message_is_summary(m)] + pending_request
++    kept: list[dict[str, Any]] = []
++    seen_pair = False
++    in_first_pair = False
++    for message in history:
++        if not _message_is_summary(message):
++            kept.append(message)
++            continue
++        is_request = str(message.get("role", "")).strip() == "user"
++        if is_request:
++            # the request opens a pair; the first one and its reply stay
++            in_first_pair = not seen_pair
++            seen_pair = True
++        if in_first_pair:
++            kept.append(message)
++    return kept + pending_request
++
++
++def _summary_replaces_history() -> bool:
++    """Whether a successful summary discards the history it summarised.
++
++    The opposite end of the design from drain sizing: instead of evicting a
++    fixed span and hoping a summary falls inside it, the summary IS the
++    history. Everything above it goes the moment it lands, leaving system
++    prompt, request, summary, and whatever the turn appends after.
++
++    Safe in the sense that matters - nothing is dropped unless a usable summary
++    exists, so a failed or rejected one leaves ordinary eviction in charge and
++    the next turn tries again. But it is the more aggressive option, not the
++    safer one: a large drain still leaves a turn or two of verbatim history,
++    where this leaves none.
++
++    Worth trying because the summaries turn out to be good. One measured at
++    7,107 characters carried the board layout, the movement lattice, which
++    actions did nothing and why, an unresolved two-branch interpretation of the
++    last result, and the next probes to run - which is most of what the evicted
++    turns were holding. And the raw frames are not in the history anyway:
++    current_frame, previous_frame, history and frame_diff are runtime globals
++    rebuilt every turn, so what eviction destroys is the interpretation, which
++    is precisely what the summary keeps.
++
++    Costs: the prefix is invalidated on every summary rather than on every
++    eviction, and the turn immediately after has no verbatim record of the turn
++    before it beyond what the opener carries.
++    """
++    return _get_env_bool("ARC3_SUMMARY_REPLACES_HISTORY", False)
++
++
++def _summary_turn_context() -> bool:
++    """Whether the summary request is told what just happened.
++
++    The request goes out at turn start, BEFORE this turn's opener exists, so
++    the newest thing in context is the previous turn's tool results. A level-up
++    is visible there only as a `level_completed` flag inside a JSON payload -
++    so a summary written at that moment can describe the level just finished as
++    if it were still current, which is exactly the material a later turn needs
++    to be right about.
++
++    What goes in: what executed, whether the board changed, why a sequence
++    stopped early, whether the level changed, and the step and level now.
++
++    What stays out: the valid actions, which are state for the next decision
++    and go stale the moment the summary outlives the turn; the tool inventory
++    and the world-model demands, which are instructions that compete with
++    "write the summary"; and the animation line, which is a pointer to go and
++    read an accessor that will describe a different action by the time anyone
++    reads the summary.
++    """
++    return _get_env_bool("ARC3_SUMMARY_TURN_CONTEXT", False)
++
++
++def _summary_enable_thinking() -> bool:
++    """Whether the summary request lets the model think first.
++
++    OFF by default. Thinking about a summary is not obviously worth it - the
++    material is all in front of the model - and it is expensive twice over:
++    observed at 18,303 characters of reasoning that reached the output limit
++    with no summary at all, and it doubles the generation for a request that
++    already runs once per interval.
++
++    The template must be able to suppress it without moving the prefix. In the
++    Qwen3-family templates the `enable_thinking` conditional wraps BOTH the
++    empty think block at the tail AND the "Reasoning effort is set to ..."
++    sentence at the top of the system message, so the stock template diverges
++    from the first tokens and every summary prefills the whole context -
++    measured as prefix reuse falling from 75% to 45%. Forcing that conditional
++    true (`{%- if true %}`) keeps the sentence unconditional and leaves only
++    the tail block varying, which restores a byte-identical prefix. Check that
++    before assuming this default is free.
++    """
++    return _get_env_bool("ARC3_SUMMARY_ENABLE_THINKING", False)
++
++
++def _summary_max_gen_tokens(default: int | None) -> int:
++    """Output limit: the normal cap, or 8192 when normal output is unlimited.
++
++    The summary is asked for everything worth keeping, so it legitimately wants
++    more room than a turn reply - and it is one request per interval, so a
++    larger ceiling costs little. Raising this keeps the thinking;
++    ARC3_SUMMARY_ENABLE_THINKING=0 removes it.
++    """
++    fallback = default if default is not None and default > 0 else 8192
++    return max(1, _get_env_int("ARC3_SUMMARY_MAX_GEN", fallback))
++
++
++def _message_is_summary(message: dict[str, Any]) -> bool:
++    return message.get(_CONTROL_MESSAGE_KEY) == _SUMMARY_CONTROL_KIND
++
++
++_CONTROL_KIND_ENV = {
++    "nudge": "ARC3_PRUNE_NUDGES",
++    "resume": "ARC3_PRUNE_RESUME_PROMPTS",
++    "stub": "ARC3_PRUNE_DEAD_STUBS",
++}
++
++
++def _prune_control_context_enabled() -> bool:
++    """Master switch: drop every kind of tagged control message when
++    committing turn messages to persistent history. The per-kind knobs
++    (ARC3_PRUNE_NUDGES / _RESUME_PROMPTS / _DEAD_STUBS) turn individual kinds
++    on without it, so an arm can attribute each effect separately."""
++    return _get_env_bool("ARC3_PRUNE_CONTROL_CONTEXT", False)
++
++
++def _prune_control_kind_enabled(kind: str) -> bool:
++    """A kind is pruned if the master switch is on OR its own knob is set.
++
++    - 'nudge'  : the "you have not acted yet" corrective (a few hundred tokens)
++    - 'resume' : the message appended when re-entering a non-executing turn
++                 (a full opener in `full` mode, the short continuation in
++                 `short` mode) - a restatement of unchanged state
++    - 'stub'   : the placeholder that ARC3_STUB_DEAD_REASONING leaves behind
++    """
++    if _prune_control_context_enabled():
++        return True
++    env_name = _CONTROL_KIND_ENV.get(kind)
++    return bool(env_name) and _get_env_bool(env_name, False)
++
++
++def _any_control_pruning_enabled() -> bool:
++    return _prune_control_context_enabled() or any(
++        _get_env_bool(name, False) for name in _CONTROL_KIND_ENV.values()
++    )
++
++
++def _mark_control_message(message: dict[str, Any], kind: str = "resume") -> dict[str, Any]:
++    message[_CONTROL_MESSAGE_KEY] = kind
++    return message
++
++
++def _strip_control_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Wire-safe copy: the private tag never leaves the process."""
++    cleaned: list[dict[str, Any]] = []
++    for message in messages:
++        if _CONTROL_MESSAGE_KEY in message:
++            copy = dict(message)
++            copy.pop(_CONTROL_MESSAGE_KEY, None)
++            cleaned.append(copy)
++        else:
++            cleaned.append(message)
++    return cleaned
++
++
++def _prune_control_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Remove tagged control messages, then strip trailing user messages.
++
++    The trailing-user strip is alternation repair, not a preference: pruning a
++    spin-out turn (opener + dead reasoning, no tool calls) would otherwise
++    leave the opener dangling while the next invocation appends another user
++    message. A turn with no tool calls executed nothing, so the next opener
++    regenerates identical state."""
++    kept = [
++        m
++        for m in messages
++        if not (
++            m.get(_CONTROL_MESSAGE_KEY)
++            and _prune_control_kind_enabled(str(m.get(_CONTROL_MESSAGE_KEY)))
++        )
++    ]
++    while kept and str(kept[-1].get("role", "")).strip() == "user":
++        kept.pop()
++    return kept
++
++
++def _reasoning_history_keys() -> tuple[str, ...]:
++    """Message key(s) under which prior reasoning is sent back to the server.
++
++    Backends disagree: OpenRouter returns and reads `reasoning`, while
++    llama.cpp returns `reasoning_content` and its chat template reads ONLY
++    that - so reasoning stored under `reasoning` is silently discarded there
++    (measured: 69 prompt tokens vs 3670 for the same text under the two keys).
++    A dropped reasoning block is invisible except as prompt growth that falls
++    short of the tokens generated.
++
++    Default `reasoning` preserves existing behaviour. Set to
++    `reasoning_content` for llama.cpp, or to a comma list to send both - which
++    is backend-agnostic but risks a template that renders both keys duplicating
++    the text."""
++    raw = os.environ.get("ARC3_REASONING_HISTORY_KEY", "").strip()
++    keys = tuple(k.strip() for k in raw.split(",") if k.strip())
++    return keys or ("reasoning",)
++
++
++def _level_inventory_enabled() -> bool:
++    """The START-vs-START object inventory shown on the first turn of a new
++    level.
++
++    It has its own switch because it answers a different question from the
++    turn-to-turn diff: not "what did my last actions do" but "what is new
++    about this level", with `appeared` types flagged as likely new mechanics.
++    Previously it rode on the auto-diff machinery and was suppressed only when
++    BOTH ARC3_AUTO_FRAME_DIFF and ARC3_DIFF_IMAGE were off - a coupling that
++    was invisible from the knob names."""
++    return _get_env_bool("ARC3_LEVEL_INVENTORY", False)
++
++
++def _resume_diff_image_enabled() -> bool:
++    """Re-attach the current turn's diff image to resumption messages.
++
++    The diff image is produced only while building a full turn opener, so a
++    resumption (short/state_only) carries the current grid but no diff. That
++    is normally harmless - a resumption happens when nothing executed, so the
++    diff would be identical to the one the turn's original opener already
++    showed. It stops being harmless when ARC3_HISTORY_IMAGE_KEEP has stripped
++    that opener's images: the model has then lost the diff entirely, and the
++    resumption is its only chance to see what changed.
++
++    Costs roughly one image per resumption. Off by default."""
++    return _get_env_bool("ARC3_RESUME_DIFF_IMAGE", False)
++
++
++def _reasoning_effort_ladder() -> list[str]:
++    """Reduced reasoning-effort levels to step down through after a truncated
++    generation, e.g. "medium,low".
++
++    A reply cut off at the output ceiling is wasted twice over: the tokens are
++    spent, and if the cut lands inside a tool call the turn produces nothing
++    callable. Rather than accommodating long generations with a bigger ceiling,
++    this asks the model for less deliberation until it completes a turn -
++    stepping one rung down per truncation and resetting once an action
++    executes, which is the evidence that the turn recovered.
++
++    Empty (default) disables the behaviour entirely."""
++    raw = os.environ.get("ARC3_REASONING_EFFORT_LADDER", "").strip()
++    return [level.strip() for level in raw.split(",") if level.strip()]
++
++
++def _preserve_thinking_kwarg() -> bool | None:
++    """Value for the `preserve_thinking` chat-template kwarg, or None to omit.
++
++    The payload builder sets chat_template_kwargs wholesale for vLLM, which
++    replaces rather than merges - so a server-side
++    --default-chat-template-kwargs carrying preserve_thinking can be silently
++    dropped by a request. Defaults to on so the request asserts it rather than
++    depending on server-side merge semantics; set to an empty string to omit
++    the key entirely and leave the server default in charge."""
++    raw = os.environ.get("ARC3_PRESERVE_THINKING", "1").strip().lower()
++    if not raw:
++        return None
++    return raw in ("1", "true", "yes", "on")
++
++
++def _openrouter_provider_prefs(provider: str) -> dict[str, Any] | None:
++    """OpenRouter request-level provider pinning. ARC3_OPENROUTER_PROVIDER
++    holds a provider name (or a comma-separated preference order); routing is
++    then restricted to that list with fallbacks disabled, so every request in
++    a run is served by a known engine. Under :nitro-style routing, providers
++    differ in media handling (some silently drop video/image parts),
++    quantization, and sampling behavior - a silent confound for any controlled
++    comparison. Unset or non-OpenRouter: no change to the request."""
++    if str(provider or "").strip().lower() != "openrouter":
++        return None
++    raw = os.environ.get("ARC3_OPENROUTER_PROVIDER", "").strip()
++    if not raw:
++        return None
++    order = [name.strip() for name in raw.split(",") if name.strip()]
++    if not order:
++        return None
++    return {"order": order, "allow_fallbacks": False}
++
++
++_SLIM_MEMORY_SECTIONS = ("World model", "Plan")
++_MEDIUM_MEMORY_SECTIONS = ("World model", "Plan", "Action model")
++
++_MEMORY_SECTION_GUIDANCE_FULL = (
++                "If you include assistant text before a tool call, use it to update your persistent memory sections. Section meanings: `World model:` = durable RULES of the environment that will still be true many actions from now (mechanics, what objects/colors mean, movement rules, win conditions) — never current positions, events, or what just happened. `Goal model:` = what winning requires. `Action model:` = what each action does mechanically. `Recent findings:` = this turn's observations and events (positions, action results, surprises). `Open questions:` = unresolved hypotheses. `Plan:` = intended next steps. `Cross-level notes:` = knowledge that carries across levels. Example — GOOD: `World model: Red cells are walls; each move shifts the player 2 cells; yellow keys open doors of the same color.` BAD: `World model: Batch stopped after 2 DOWNs, player now at (4,2).` (that belongs in `Recent findings:`). IMPORTANT: each labeled section you write REPLACES the stored version shown under 'Working world model carried from earlier turns' — write the COMPLETE updated section; any fact you omit is permanently lost."
++)
++
++_MEMORY_SECTION_MEANINGS = {
++    "World model": (
++        "durable RULES of the environment that will still be true many actions from now "
++        "(mechanics, what objects/colors mean, movement rules, win conditions) - never "
++        "current positions or what just happened"
++    ),
++    "Goal model": "what winning requires",
++    "Action model": "what each action does mechanically",
++    "Recent findings": "this turn's observations",
++    "Open questions": "unresolved hypotheses",
++    "Plan": "intended next steps",
++    "Cross-level notes": "knowledge that carries across levels",
++}
++
++
++def _advertised_section_labels() -> tuple[str, ...]:
++    """The sections the model should be TOLD about: exactly those the current
++    mode carries.
++
++    Advertising all seven while a mode drops five invites the model to write
++    into sections it will never see again - the write is parsed, stored, and
++    silently discarded from the prompt. It also confounds a slim/medium arm,
++    because a poor result could mean either that fewer sections hurt or that
++    output was wasted on sections that went nowhere."""
++    labels = _memory_section_labels()
++    if labels is None:
++        return tuple(_MEMORY_SECTION_MEANINGS)
++    # canonical order, so the advertisement matches the order the carried block
++    # renders them in
++    chosen = set(labels)
++    return tuple(name for name in _MEMORY_SECTION_MEANINGS if name in chosen)
++
++
++def _section_list_phrase(labels: tuple[str, ...], conjunction: str = "and") -> str:
++    """Render the labels as prose. The conjunction is a parameter because the
++    two call sites word it differently: the opener lists what is available
++    ("and"), the no-tool-call followup offers alternatives ("or")."""
++    quoted = [f"`{name}:`" for name in labels]
++    if len(quoted) == 1:
++        return quoted[0]
++    if len(quoted) == 2:
++        # no serial comma before a two-item conjunction
++        return f" {conjunction} ".join(quoted)
++    return ", ".join(quoted[:-1]) + f", {conjunction} " + quoted[-1]
++
++
++def _memory_section_guidance_upstream() -> str:
++    return (
++        "If you include assistant text before a tool call, keep it short and use it to "
++        "update the world model. Helpful optional prefixes are "
++        f"{_section_list_phrase(_advertised_section_labels())}."
++    )
++
++
++def _memory_section_guidance_empty() -> str:
++    labels = _advertised_section_labels()
++    meanings = " ".join(
++        f"`{name}:` = {_MEMORY_SECTION_MEANINGS[name]}." for name in labels
++    )
++    return (
++        "You have no stored memory sections yet. If you include assistant text before a "
++        f"tool call, use it to start them: {meanings}"
++    )
++
++
++_MEMORY_SECTION_GUIDANCE_UPSTREAM = (
++    "If you include assistant text before a tool call, keep it short and use it to update "
++    "the world model. Helpful optional prefixes are `World model:`, `Goal model:`, "
++    "`Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and "
++    "`Cross-level notes:`."
++)
++
++
++def _wm_section_explanation_mode() -> str:
